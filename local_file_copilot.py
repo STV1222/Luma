@@ -13,10 +13,14 @@ Run:
 """
 
 from __future__ import annotations
-import os, sys, re, time, subprocess, platform, threading, math
+import os, sys, re, time, subprocess, platform, threading, math, json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any
+from pathlib import Path
+from langchain.llms import Ollama
+from langchain.callbacks.manager import CallbackManager
+from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
 
 # ----------------------------- UI IMPORTS ------------------------------------
 from PyQt6.QtCore import Qt, QAbstractListModel, QModelIndex, QSize, QTimer, QThread, pyqtSignal
@@ -38,6 +42,116 @@ try:
     HAVE_RAPIDFUZZ = True
 except Exception:
     HAVE_RAPIDFUZZ = False
+
+
+# ============================ AI ASSISTANT ===================================
+
+class LumaAI:
+    """Ollama-powered AI assistant for Luma"""
+    
+    def __init__(self):
+        self.model = None
+        self.initialized = False
+    
+    def ensure_initialized(self):
+        """Lazy initialization of the model"""
+        if not self.initialized:
+            try:
+                self.model = Ollama(
+                    model="mistral",
+                    callback_manager=CallbackManager([StreamingStdOutCallbackHandler()]),
+                )
+                self.initialized = True
+            except Exception as e:
+                print(f"Warning: Could not initialize Ollama: {e}")
+                return False
+        return True
+
+    def parse_query(self, query: str) -> Dict[str, Any]:
+        """Parse a natural language query using Ollama"""
+        if not self.ensure_initialized():
+            # Fallback to traditional parsing if AI isn't available
+            return {
+                "keywords": extract_keywords(query),
+                "time_range": extract_time_window(query),
+                "file_types": []
+            }
+
+        system_prompt = """You are a file search assistant. Analyze the search query and extract:
+1. Important keywords (excluding common words)
+2. Time ranges or dates
+3. File types or extensions
+4. Special requirements or conditions
+Format your response as JSON with these keys: keywords, time_range, file_types, special_reqs"""
+
+        try:
+            response = self.model.invoke(
+                f"{system_prompt}\nQuery: {query}\nResponse:"
+            )
+            
+            # Extract JSON from response
+            json_str = response.strip()
+            if not json_str.startswith("{"):
+                json_str = json_str[json_str.find("{"):]
+            if not json_str.endswith("}"):
+                json_str = json_str[:json_str.rfind("}")+1]
+                
+            result = json.loads(json_str)
+            
+            # Convert time range to timestamps
+            if result.get("time_range"):
+                result["time_range"] = extract_time_window(result["time_range"])
+            else:
+                result["time_range"] = (None, None)
+                
+            return result
+            
+        except Exception as e:
+            print(f"AI parsing failed: {e}, falling back to traditional parsing")
+            return {
+                "keywords": extract_keywords(query),
+                "time_range": extract_time_window(query),
+                "file_types": []
+            }
+
+    def enhance_results(self, query: str, results: List[Tuple[str, float]]) -> List[Tuple[str, float]]:
+        """Enhance search results ranking using AI understanding"""
+        if not self.ensure_initialized():
+            return results
+            
+        try:
+            # Get AI's opinion on result relevance
+            paths = [path for path, _ in results[:10]]  # Process top 10 for efficiency
+            prompt = f"""Rate how relevant these files are to the query: "{query}"
+Files:
+{chr(10).join(paths)}
+
+Rate each file's relevance from 0-100 based on the filename and path.
+Respond with a JSON list of scores only, like: [95, 80, 70, ...]"""
+
+            response = self.model.invoke(prompt)
+            
+            # Extract scores from response
+            scores_str = response[response.find("["):response.find("]")+1]
+            ai_scores = json.loads(scores_str)
+            
+            # Blend AI scores with original scores
+            enhanced_results = []
+            for i, (path, score) in enumerate(results):
+                if i < len(ai_scores):
+                    # Blend original score (70%) with AI score (30%)
+                    new_score = score * 0.7 + ai_scores[i] * 0.3
+                    enhanced_results.append((path, new_score))
+                else:
+                    enhanced_results.append((path, score))
+                    
+            # Sort by new scores
+            enhanced_results.sort(key=lambda x: x[1], reverse=True)
+            return enhanced_results
+            
+        except Exception as e:
+            print(f"AI enhancement failed: {e}, using original results")
+            return results
 
 # ============================ SEARCH SECTION =================================
 # (Adapted from your provided script; trimmed to essentials and imported here.)
@@ -168,6 +282,7 @@ class ResultsModel(QAbstractListModel):
 
     def data(self, index: QModelIndex, role: int):  # type: ignore[override]
         if not index.isValid():
+            
             return None
         hit = self._items[index.row()]
         if role == Qt.ItemDataRole.DisplayRole:
@@ -198,21 +313,51 @@ class ResultDelegate(QStyledItemDelegate):
         hit: FileHit = index.model().item(index.row())  # type: ignore
         if not hit:
             return super().paint(painter, option, index)
+            
         painter.save()
         r = option.rect
-        if option.state & QStyle.StateFlag.State_Selected:
-            painter.fillRect(r, option.palette.highlight())
+        
+        # Don't draw selection background (handled by stylesheet)
+        
+        # Draw icon with slight adjustment for visual balance
         icon: QIcon = index.data(Qt.ItemDataRole.DecorationRole)
         pix = icon.pixmap(32, 32)
-        painter.drawPixmap(r.left() + 14, r.top() + 16, pix)
+        icon_y = r.top() + (r.height() - 32) // 2  # Center vertically
+        painter.drawPixmap(r.left() + 16, icon_y, pix)
+        
+        # Calculate text rectangles
+        text_left = r.left() + 64
+        text_width = r.width() - 80
+        
+        # Draw filename with larger, bold font
         name = os.path.basename(hit.path)
-        path = elide_middle(hit.path, 80)
+        font = painter.font()
+        font.setPointSize(font.pointSize() + 1)
+        font.setBold(True)
+        painter.setFont(font)
+        
+        if option.state & QStyle.StateFlag.State_Selected:
+            painter.setPen(Qt.GlobalColor.white)
+        else:
+            painter.setPen(option.palette.windowText().color())
+            
+        painter.drawText(text_left, r.top() + 24, name)
+        
+        # Draw path and metadata with smaller font
+        font.setPointSize(font.pointSize() - 2)
+        font.setBold(False)
+        painter.setFont(font)
+        
+        if option.state & QStyle.StateFlag.State_Selected:
+            painter.setPen(Qt.GlobalColor.lightGray)
+        else:
+            painter.setPen(option.palette.mid().color())
+            
+        path = elide_middle(os.path.dirname(hit.path), 60)
         dt = datetime.fromtimestamp(hit.mtime).strftime('%Y-%m-%d %H:%M')
-        info = f"{path}   •   {dt}   •   {human_size(hit.size)}   •   {hit.score}"
-        painter.setPen(option.palette.windowText().color())
-        painter.drawText(r.left() + 60, r.top() + 24, name)
-        painter.setPen(option.palette.mid().color())
-        painter.drawText(r.left() + 60, r.top() + 44, info)
+        info = f"{path}  •  {dt}  •  {human_size(hit.size)}"
+        painter.drawText(text_left, r.top() + 44, info)
+        
         painter.restore()
 
 # ============================ SEARCH WORKER ==================================
@@ -248,15 +393,18 @@ class SpotlightUI(QWidget):
         self.setMinimumSize(980, 580)
         self._folders = DEFAULT_FOLDERS[:]
         self._worker: Optional[SearchWorker] = None
+        
+        # Initialize AI assistant
+        self.ai = LumaAI()
 
         wrapper = QFrame(); wrapper.setObjectName("wrapper"); wrapper.setFrameShape(QFrame.Shape.NoFrame)
 
-        self.search = QLineEdit(); self.search.setPlaceholderText("Search files… (e.g., magic at your fingertips, pdf today)")
-        self.search.returnPressed.connect(self._open_selected)
-        self.search.textEdited.connect(self._debounced_search)
+        self.search = QLineEdit(); self.search.setPlaceholderText("Search files… (press Enter to search)")
+        self.search.returnPressed.connect(self._perform_search)  # Search on Enter
+        # Remove real-time search
 
         self.filter = QComboBox(); self.filter.addItems(list(FILETYPE_MAP.keys()))
-        self.filter.currentIndexChanged.connect(self._debounced_search)
+        self.filter.currentIndexChanged.connect(self._perform_search)  # Search immediately when filter changes
 
         top = QHBoxLayout(); top.addWidget(self.search, 1); top.addWidget(self.filter, 0)
 
@@ -274,20 +422,24 @@ class SpotlightUI(QWidget):
         lay = QVBoxLayout(wrapper); lay.addLayout(top); lay.addWidget(divider()); lay.addWidget(split, 1)
         outer = QVBoxLayout(self); outer.addWidget(wrapper)
 
-        self._debounce = QTimer(self); self._debounce.setSingleShot(True); self._debounce.timeout.connect(self._perform_search)
-
-        self._apply_style(); center_on_screen(self); self.show(); self.search.setFocus(); self._perform_search()
+        self._apply_style(); center_on_screen(self); self.show(); self.search.setFocus()
 
     # --------------------------- Search plumbing ----------------------------
-    def _debounced_search(self):
-        self._debounce.start(220)
 
     def _perform_search(self):
         q = self.search.text().strip()
         category = self.filter.currentText()
         allow_exts = FILETYPE_MAP.get(category, [])
-        keywords = extract_keywords(q)
-        time_range = extract_time_window(q)
+        
+        # Use AI to parse the query
+        query_info = self.ai.parse_query(q)
+        keywords = query_info["keywords"]
+        time_range = query_info["time_range"]
+        
+        # Add any AI-detected file types to the filter
+        ai_exts = query_info.get("file_types", [])
+        if ai_exts and not allow_exts:  # Only use AI exts if no category filter
+            allow_exts.extend(ai_exts)
 
         if self._worker and self._worker.isRunning():
             self._worker.requestInterruption()
@@ -299,9 +451,39 @@ class SpotlightUI(QWidget):
         self._worker.start()
 
     def _apply_hits(self, hits: List[FileHit]):
-        self.model.set_items(hits)
-        if hits:
-            self.list.setCurrentIndex(self.model.index(0))
+        if not hits:
+            self.model.set_items([])
+            return
+
+        # Convert hits to format expected by enhance_results
+        results = [(hit.path, float(hit.score)) for hit in hits]
+        
+        # Enhance results using AI
+        enhanced = self.ai.enhance_results(self.search.text().strip(), results)
+        
+        # Convert back to FileHit objects and sort by score
+        enhanced_hits = []
+        for path, score in enhanced:
+            try:
+                st = os.stat(path)
+                enhanced_hits.append(FileHit(
+                    path=path,
+                    score=int(score),
+                    mtime=st.st_mtime,
+                    size=st.st_size
+                ))
+            except Exception:
+                continue
+        
+        # Sort by score in descending order
+        enhanced_hits.sort(key=lambda x: x.score, reverse=True)
+        
+        # Update model and select top result
+        self.model.set_items(enhanced_hits)
+        if enhanced_hits:
+            top_index = self.model.index(0)
+            self.list.setCurrentIndex(top_index)
+            self.list.scrollTo(top_index, QListView.ScrollHint.PositionAtTop)  # Ensure top result is visible
 
     # --------------------------- Actions ------------------------------------
     def contextMenuEvent(self, event):
@@ -399,6 +581,18 @@ class SpotlightUI(QWidget):
                 border: none;
                 padding: 4px;
                 color: #f0f0f0;
+            }
+            QListView::item {
+                border-radius: 8px;
+                padding: 4px;
+                margin: 2px 4px;
+            }
+            QListView::item:selected {
+                background: rgba(255,255,255,0.15);
+                border: 1px solid rgba(255,255,255,0.3);
+            }
+            QListView::item:hover:!selected {
+                background: rgba(255,255,255,0.08);
             }
             QSplitter::handle { background: rgba(255,255,255,10); }
             QLabel#previewTitle { color: #ffffff; font-weight: 600; font-size: 18px; }
