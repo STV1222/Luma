@@ -4,7 +4,7 @@ Luma – Desktop Spotlight-style UI for your file search engine (PyQt6)
 """
 
 from __future__ import annotations
-import os, sys, re, time, subprocess, platform, math, json, tempfile, shutil
+import os, sys, re, time, subprocess, platform, math, json, tempfile, shutil, calendar
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import List, Tuple, Optional, Dict, Any
@@ -71,6 +71,12 @@ DATE_PATTERNS = [
     r"\b\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s*,?\s*\d{4}\b",
     r"\b\d{4}-\d{2}-\d{2}\b",
 ]
+# Month-year without a day (e.g., "May 2025" or "2025 May" or "2025-05")
+MONTH_YEAR_PATTERNS = [
+    r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{4}\b",
+    r"\b\d{4}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\b",
+    r"\b(20\d{2})-(0[1-9]|1[0-2])\b",
+]
 REL_TIME_PATTERNS = [(r"\btoday\b", 0), (r"\byesterday\b", 1), (r"\blast\s+week\b", 7), (r"\blast\s+month\b", 30)]
 ABS_YEAR = re.compile(r"\b(20\d{2})\b")
 STOPWORDS = {"find","show","get","open","the","a","an","me","my","files","file","of","for","about","last","this","that","these","those","recent","latest"}
@@ -119,6 +125,36 @@ def extract_time_window(q: str) -> Tuple[float, float] | Tuple[None, None]:
                     return (s, e)
                 except ValueError:
                     pass
+    # Month-year handling (e.g., "May 2025" or "2025 May" or "2025-05")
+    for pat in MONTH_YEAR_PATTERNS:
+        m = re.search(pat, q, re.IGNORECASE)
+        if m:
+            token = m.group(0)
+            year = None; month = None
+            # Try numeric YYYY-MM
+            mnum = re.match(r"^(20\d{2})-(0[1-9]|1[0-2])$", token)
+            if mnum:
+                year = int(mnum.group(1)); month = int(mnum.group(2))
+            else:
+                # Try named month first or second
+                parts = re.findall(r"(20\d{2}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*)", token, re.IGNORECASE)
+                if len(parts) >= 2:
+                    # Normalize month name
+                    def to_month(p: str) -> int | None:
+                        try:
+                            return datetime.strptime(p[:3].title(), "%b").month
+                        except Exception:
+                            return None
+                    # Determine order
+                    if parts[0].isdigit():
+                        year = int(parts[0]); month = to_month(parts[1])
+                    else:
+                        month = to_month(parts[0]); year = int(parts[1]) if parts[1].isdigit() else None
+            if year and month:
+                start = datetime(year, month, 1)
+                last_day = calendar.monthrange(year, month)[1]
+                end = datetime(year, month, last_day, 23, 59, 59, 999999)
+                return (start.timestamp(), end.timestamp())
     for pat, days_back in REL_TIME_PATTERNS:
         if re.search(pat, ql):
             s = (now - timedelta(days=days_back)).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
@@ -146,7 +182,8 @@ class LumaAI:
 
     def parse_query_nonai(self, query: str) -> Dict[str, Any]:
         tr = extract_time_window(query)
-        return {"keywords": extract_keywords(query),
+        kws = strip_time_keywords(extract_keywords(query), query, tr)
+        return {"keywords": kws,
                 "time_range": None if tr==(None,None) else tr,
                 "file_types": [], "time_attr": "mtime"}
 
@@ -165,10 +202,21 @@ class LumaAI:
             if not raw.startswith("{"): raw = raw[raw.find("{"):]
             if not raw.endswith("}"): raw = raw[:raw.rfind("}")+1]
             data = json.loads(raw)
-            tr = extract_time_window(str(data.get("time_range","")) or "")
+            # Prefer month-wide ranges if the natural-language query contains a month-year,
+            # even if the LLM narrowed it to a specific day.
+            tr_model = extract_time_window(str(data.get("time_range","")) or "")
+            tr_query = extract_time_window(query)
+            def span(t):
+                if not t or t==(None,None): return 0
+                s,e=t; 
+                if s is None or e is None: return 0
+                return max(0, e - s)
+            tr = tr_query if span(tr_query) > span(tr_model) else tr_model
             allow = ['.'+e.lstrip('.') for e in data.get("file_types", [])]
             time_attr = "birthtime" if str(data.get("action","")).lower().startswith("creat") else "mtime"
-            return {"keywords": data.get("keywords", []) or extract_keywords(query),
+            kws = data.get("keywords", []) or extract_keywords(query)
+            kws = strip_time_keywords(kws, query, tr)
+            return {"keywords": kws,
                     "time_range": None if tr==(None,None) else tr,
                     "file_types": allow, "time_attr": time_attr}
         except Exception:
@@ -180,6 +228,30 @@ def extract_keywords(q: str) -> List[str]:
     q_wo = re.sub(r'"[^"]+"', ' ', q)
     words = re.findall(r"[A-Za-z0-9_\-]+", q_wo)
     return [*quoted, *[w for w in words if w.lower() not in STOPWORDS]]
+
+def strip_time_keywords(keywords: List[str], original_query: str, time_range: Tuple[float,float] | Tuple[None,None]) -> List[str]:
+    if not keywords:
+        return keywords
+    # Remove month names and years if we already have an explicit time window
+    months = {
+        "jan","january","feb","february","mar","march","apr","april","may","jun","june",
+        "jul","july","aug","august","sep","sept","september","oct","october","nov","november","dec","december"
+    }
+    noise = {"edited","created","modified","updated","on","in","during","between","from","to","at"}
+    has_time = time_range and time_range != (None, None)
+    cleaned: List[str] = []
+    for w in keywords:
+        wl = w.lower()
+        if wl in noise:
+            continue
+        if wl in months:
+            # Drop month tokens so they don't constrain filenames
+            continue
+        if has_time and re.fullmatch(r"20\d{2}", wl):
+            # If a range is detected, year tokens in keywords are redundant
+            continue
+        cleaned.append(w)
+    return cleaned
 
 def filename_score(name: str, kws: List[str]) -> float:
     base = name.lower()
@@ -254,28 +326,31 @@ class ResultDelegate(QStyledItemDelegate):
         if not h: return super().paint(p,opt,idx)
         p.save(); r=opt.rect
         icon:QIcon = idx.data(Qt.ItemDataRole.DecorationRole)
-        # Render smaller, crisp icons aligned with filename baseline (18px, HiDPI aware)
+        # Render slightly smaller, crisp icons aligned with filename baseline (16px, HiDPI aware)
         dpr = p.device().devicePixelRatioF() if hasattr(p.device(), 'devicePixelRatioF') else 1.0
-        size_px = int(18 * dpr)
+        icon_size = 16
+        gap_px = 20  # space between icon and text
+        size_px = int(icon_size * dpr)
         pix = icon.pixmap(size_px, size_px)
         try:
             pix.setDevicePixelRatio(dpr)
         except Exception:
             pass
-        # Align icon vertical center with the filename text midline for neat layout
-        f=p.font(); f.setPointSize(f.pointSize()+1); f.setBold(True)
+        # Align icon vertically with the filename baseline
+        f=p.font(); f.setPointSize(f.pointSize()+1); f.setBold(True); p.setFont(f)
         fm = p.fontMetrics()
-        base_y = r.top()+24
-        text_mid_y = base_y - fm.ascent() + (fm.height()//2)
+        base_y = r.top()+24  # text baseline for the filename
+        # Center icon around the visual midline of the text (ascent-descent)/2 above baseline
+        text_mid_y = base_y - ((fm.ascent() - fm.descent()) / 2.0)
         icon_x = r.left()+12
-        icon_y = int(text_mid_y - (18/2))
+        icon_y = int(text_mid_y - (icon_size/2))
         p.drawPixmap(icon_x, icon_y, pix)
         name=os.path.basename(h.path)
         meta=f"{elide_middle(os.path.dirname(h.path),42)}  •  {human_size(h.size)}"
-        p.setFont(f)
-        p.setPen(opt.palette.windowText().color()); p.drawText(r.left()+40, r.top()+24, name)
+        text_x = icon_x + icon_size + gap_px
+        p.setPen(opt.palette.windowText().color()); p.drawText(text_x, r.top()+24, name)
         f.setPointSize(f.pointSize()-2); f.setBold(False); p.setFont(f)
-        p.setPen(opt.palette.mid().color()); p.drawText(r.left()+44, r.top()+40, meta)
+        p.setPen(opt.palette.mid().color()); p.drawText(text_x, r.top()+40, meta)
         p.restore()
 
 # ============================ spinner ==============================
@@ -582,9 +657,9 @@ class SpotlightUI(QWidget):
         leftLay.addWidget(self.list, 1)
 
         split=QSplitter(); split.addWidget(leftPane); split.addWidget(self.preview)
-        # Favor preview width so the file view can be larger by default
-        split.setStretchFactor(0,1); split.setStretchFactor(1,9)
-        split.setSizes([290, 1920])
+        # Default to 60:40 split (left:list, right:preview)
+        split.setStretchFactor(0,3); split.setStretchFactor(1,2)
+        split.setSizes([600, 400])
 
         lay=QVBoxLayout(wrapper); lay.addLayout(top); lay.addWidget(divider()); lay.addWidget(split,1)
         outer=QVBoxLayout(self); outer.addWidget(wrapper)
