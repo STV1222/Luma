@@ -73,8 +73,8 @@ pip install rapidfuzz Pillow pdf2image langchain-community
 brew install poppler
 
 # Optional: Local LLM for Ask AI + Summarize/Q&A
-# Install and run Ollama separately, then pull a model (e.g., mistral)
-ollama pull mistral
+# Install and run Ollama separately, then pull a model (Gemma 2 2B)
+ollama pull gemma2:2b
 ```
 
 ### Run the modular app

@@ -43,7 +43,7 @@ class ResultDelegate(QStyledItemDelegate):
         icon:QIcon = idx.data(Qt.ItemDataRole.DecorationRole)
         dpr = p.device().devicePixelRatioF() if hasattr(p.device(), 'devicePixelRatioF') else 1.0
         icon_size = 16
-        gap_px = 12
+        gap_px = 24
         size_px = int(icon_size * dpr)
         pix = icon.pixmap(size_px, size_px)
         try: pix.setDevicePixelRatio(dpr)

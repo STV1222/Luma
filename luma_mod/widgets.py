@@ -2,15 +2,19 @@ from __future__ import annotations
 import os, tempfile, shutil, subprocess
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QTimer, QFileInfo
+from PyQt6.QtCore import Qt, QTimer, QFileInfo, QThread, pyqtSignal
 from PyQt6.QtGui import QPixmap, QImage
 from PyQt6.QtWidgets import QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame, QGridLayout, QSizePolicy, QCheckBox, QFileIconProvider, QPushButton, QTextEdit
 
 try:
     from .utils import is_macos, find_poppler_bin, FILETYPE_MAP, human_size, elide_middle
+    from .content import TEXT_EXTS
+    from .i18n import tr
 except Exception:
     # Fallback for when the module is run without package context
     from luma_mod.utils import is_macos, find_poppler_bin, FILETYPE_MAP, human_size, elide_middle
+    from luma_mod.content import TEXT_EXTS
+    from luma_mod.i18n import tr
 
 try:
     from pdf2image import convert_from_path
@@ -23,6 +27,130 @@ try:
     HAVE_PIL = True
 except Exception:
     HAVE_PIL = False
+
+
+class PreviewWorker(QThread):
+    """Worker thread for generating file previews to prevent UI blocking."""
+    preview_ready = pyqtSignal(str, QPixmap, str)  # path, pixmap, orientation
+    preview_failed = pyqtSignal(str, str)  # path, error_message
+    
+    def __init__(self, path: str, ext: str):
+        super().__init__()
+        self.path = path
+        self.ext = ext
+        self._should_stop = False
+    
+    def stop(self):
+        self._should_stop = True
+        self.quit()
+        self.wait(1000)  # Wait up to 1 second for thread to finish
+    
+    def run(self):
+        if self._should_stop:
+            return
+            
+        try:
+            if HAVE_PIL and self.ext in FILETYPE_MAP["Images"]:
+                self._process_image()
+            elif HAVE_PDF and self.ext == ".pdf":
+                self._process_pdf()
+            elif is_macos() and self.ext in {".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".csv", ".rtf", ".txt", ".md"}:
+                self._process_quicklook()
+            else:
+                self._process_generic()
+        except Exception as e:
+            if not self._should_stop:
+                self.preview_failed.emit(self.path, str(e))
+    
+    def _process_image(self):
+        if self._should_stop:
+            return
+        pix = QPixmap(self.path)
+        if not pix.isNull():
+            orientation = 'landscape' if pix.width() >= pix.height() else 'portrait'
+            self.preview_ready.emit(self.path, pix, orientation)
+        else:
+            self.preview_failed.emit(self.path, "Failed to load image")
+    
+    def _process_pdf(self):
+        if self._should_stop:
+            return
+        try:
+            poppler_bin = find_poppler_bin() or "/usr/local/bin"
+            base_dpi = 200
+            dpi = max(100, int(base_dpi * 1.0))  # Simplified DPI calculation
+            
+            pages = convert_from_path(self.path, dpi=dpi, first_page=1, last_page=1, poppler_path=poppler_bin)
+            if not pages:
+                self.preview_failed.emit(self.path, "PDF has no pages")
+                return
+                
+            if self._should_stop:
+                return
+                
+            img = pages[0]
+            if img.mode != "RGB": 
+                img = img.convert("RGB")
+            w, h = img.width, img.height
+            qimg = QImage(img.tobytes("raw","RGB"), w, h, w*3, QImage.Format.Format_RGB888)
+            qpix = QPixmap.fromImage(qimg)
+            orientation = 'landscape' if w >= h else 'portrait'
+            self.preview_ready.emit(self.path, qpix, orientation)
+        except Exception as e:
+            self.preview_failed.emit(self.path, f"PDF processing failed: {str(e)[:50]}")
+    
+    def _process_quicklook(self):
+        if self._should_stop:
+            return
+        try:
+            size = 512
+            temp_dir = tempfile.mkdtemp(prefix="luma_ql_")
+            try:
+                result = subprocess.run(["qlmanage", "-t", "-s", str(size), "-o", temp_dir, self.path],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, 
+                                       check=False, timeout=8)
+                
+                if result.returncode != 0 or self._should_stop:
+                    self.preview_failed.emit(self.path, "QuickLook failed")
+                    return
+                    
+                candidates = [os.path.join(temp_dir, f) for f in os.listdir(temp_dir)
+                              if f.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff"))]
+                if not candidates:
+                    self.preview_failed.emit(self.path, "No QuickLook preview generated")
+                    return
+                    
+                best = max(candidates, key=os.path.getmtime)
+                pix = QPixmap(best)
+                if pix.isNull() or self._should_stop:
+                    self.preview_failed.emit(self.path, "Failed to load QuickLook preview")
+                    return
+                    
+                orientation = 'landscape' if pix.width() >= pix.height() else 'portrait'
+                self.preview_ready.emit(self.path, pix, orientation)
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+        except subprocess.TimeoutExpired:
+            self.preview_failed.emit(self.path, "QuickLook timeout")
+        except Exception as e:
+            self.preview_failed.emit(self.path, f"QuickLook failed: {str(e)[:50]}")
+    
+    def _process_generic(self):
+        if self._should_stop:
+            return
+        try:
+            provider = QFileIconProvider()
+            icon = provider.icon(QFileInfo(self.path))
+            pix = icon.pixmap(256, 256)
+            if pix.isNull(): 
+                pix = icon.pixmap(128, 128)
+            if not pix.isNull():
+                orientation = 'landscape' if pix.width() >= pix.height() else 'portrait'
+                self.preview_ready.emit(self.path, pix, orientation)
+            else:
+                self.preview_failed.emit(self.path, "No preview available")
+        except Exception as e:
+            self.preview_failed.emit(self.path, f"Generic preview failed: {str(e)[:50]}")
 
 
 class BusySpinner(QWidget):
@@ -75,21 +203,26 @@ def ext_to_type(ext: str) -> str:
 class PreviewPane(QWidget):
     def __init__(self):
         super().__init__()
+        self.setObjectName("previewPane")
+        # Remove individual styling - let the main UI CSS handle it
+        self._current_worker: Optional[PreviewWorker] = None
         root = QVBoxLayout(self); root.setContentsMargins(24,12,24,12)
         top = QHBoxLayout(); top.setSpacing(24)
 
         self.card = QFrame(); self.card.setObjectName("thumbCard")
         self.card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        # Remove individual styling - let the main UI CSS handle it
         cLay = QVBoxLayout(self.card); cLay.setContentsMargins(0,0,0,0)
         self.thumb = QLabel(); self.thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.thumb.setMinimumSize(0, 0)
         self.thumb.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.thumb.setScaledContents(False)
+        # Remove individual styling - let the main UI CSS handle it
         cLay.addWidget(self.thumb)
         top.addWidget(self.card, 1)
 
-        metaHeader = QLabel("Metadata"); metaHeader.setObjectName("metaHeader")
-        self.btn_summarize = QPushButton("Summarize")
+        metaHeader = QLabel(tr("metadata")); metaHeader.setObjectName("metaHeader")
+        self.btn_summarize = QPushButton(tr("summarize"))
         self.btn_summarize.setVisible(False)
         self.btn_summarize.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_summarize.setToolTip("Generate a concise summary of this file with the local AI")
@@ -108,7 +241,7 @@ class PreviewPane(QWidget):
             row.setColumnStretch(1, 1)
             row.addWidget(l, 0, 0, alignment=Qt.AlignmentFlag.AlignVCenter)
             row.addWidget(v, 0, 1, alignment=Qt.AlignmentFlag.AlignVCenter)
-            wrap = QVBoxLayout(); wrap.setSpacing(4); wrap.setContentsMargins(0,6,0,6)
+            wrap = QVBoxLayout(); wrap.setSpacing(2); wrap.setContentsMargins(0,3,0,3)
             cont = QWidget(); cont.setLayout(row); cont.setObjectName("rowContainer")
             wrap.addWidget(cont)
             sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine); sep.setObjectName("rowSep")
@@ -125,7 +258,7 @@ class PreviewPane(QWidget):
         self.v_tags    = add_row("Tags")
         self.v_created = add_row("Created")
 
-        metaWrap = QVBoxLayout(); metaWrap.setSpacing(6); metaWrap.setContentsMargins(0,0,0,0)
+        metaWrap = QVBoxLayout(); metaWrap.setSpacing(3); metaWrap.setContentsMargins(0,0,0,0)
         headerRow = QHBoxLayout(); headerRow.setContentsMargins(0,0,0,0)
         headerRow.addWidget(metaHeader); headerRow.addStretch(1)
         metaWrap.addLayout(headerRow)
@@ -136,19 +269,25 @@ class PreviewPane(QWidget):
         self._orig_thumb: Optional[QPixmap] = None
         self._orig_orientation: Optional[str] = None
         # Summary section
-        sumHeader = QLabel("Summary"); sumHeader.setObjectName("metaHeader")
+        sumHeader = QLabel(tr("summary")); sumHeader.setObjectName("metaHeader")
         sumRow = QHBoxLayout(); sumRow.setContentsMargins(0,0,0,0)
-        sumRow.addWidget(sumHeader); sumRow.addStretch(1); sumRow.addWidget(self.btn_summarize)
+        sumRow.addWidget(sumHeader); sumRow.addStretch(1)
+        sumRow.addWidget(self.btn_summarize)
         root.addLayout(sumRow, 0)
         self.summary = QTextEdit(); self.summary.setReadOnly(True); self.summary.setVisible(False)
         root.addWidget(self.summary, 2)
 
     def set_file(self, path: Optional[str]):
+        # Stop any existing worker
+        if self._current_worker and self._current_worker.isRunning():
+            self._current_worker.stop()
+        
         self._orig_thumb = None
         self.thumb.clear()
         for _,v in self._rows: v.setText("—")
         self.summary.clear(); self.summary.setVisible(False); self.btn_summarize.setVisible(False)
         if not path: return
+        
         try:
             from os import stat
             st = stat(path)
@@ -163,25 +302,27 @@ class PreviewPane(QWidget):
         except Exception:
             self.v_where.setText(elide_middle(path,80))
 
-        ext = os.path.splitext(path)[1].lower()
-        if HAVE_PIL and ext in FILETYPE_MAP["Images"]:
-            pix = QPixmap(path)
-            if not pix.isNull():
-                self._set_thumb(pix)
-                self._orig_orientation = 'landscape' if pix.width() >= pix.height() else 'portrait'
-                # Images not summarized by default (OCR not enabled)
-                return
-        if HAVE_PDF and ext == ".pdf":
-            self._show_pdf_thumb(path); self.btn_summarize.setVisible(True); return
-        if is_macos() and ext in {".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".csv", ".rtf", ".txt", ".md"}:
-            if self._show_quicklook_thumb(path):
-                # Show summarize for text and supported office types
-                self.btn_summarize.setVisible(ext in {".txt", ".md", ".docx", ".pptx"})
-                return
-        self._show_generic_icon(path)
-        # Show summarize button for selected file; enable guidance via tooltip
-        if ext in {".txt",".md",".py",".json",".csv",".log",".yaml",".yml",".ini",".cfg",".toml",".pdf",".docx",".pptx"}:
+        # Start preview generation in worker thread
+        self._current_worker = PreviewWorker(path, ext)
+        self._current_worker.preview_ready.connect(self._on_preview_ready)
+        self._current_worker.preview_failed.connect(self._on_preview_failed)
+        self._current_worker.start()
+        
+        # Show loading message
+        self.thumb.setText(tr("loading_preview"))
+        
+        # Show summarize button for text-like and supported doc types
+        if (ext in TEXT_EXTS) or (ext in {".pdf",".docx",".pptx"}):
             self.btn_summarize.setVisible(True)
+    
+    def _on_preview_ready(self, path: str, pixmap: QPixmap, orientation: str):
+        """Handle successful preview generation."""
+        self._set_thumb(pixmap)
+        self._orig_orientation = orientation
+    
+    def _on_preview_failed(self, path: str, error_message: str):
+        """Handle failed preview generation."""
+        self.thumb.setText(f"{tr('preview_failed')}: {error_message}")
 
     def resizeEvent(self, ev):
         super().resizeEvent(ev); self._fit_thumb()
@@ -203,60 +344,5 @@ class PreviewPane(QWidget):
             pass
         self.thumb.setPixmap(scaled)
 
-    def _show_pdf_thumb(self, path: str):
-        try:
-            poppler_bin = find_poppler_bin() or "/usr/local/bin"
-            base_dpi = 300
-            dpr = self.devicePixelRatioF()
-            dpi = max(150, int(base_dpi * dpr))
-            pages = convert_from_path(path, dpi=dpi, first_page=1, last_page=1, poppler_path=poppler_bin)
-            if not pages: self.thumb.setText("PDF has no pages."); return
-            img = pages[0]
-            if img.mode != "RGB": img = img.convert("RGB")
-            w, h = img.width, img.height
-            qimg = QImage(img.tobytes("raw","RGB"), w, h, w*3, QImage.Format.Format_RGB888)
-            qpix = QPixmap.fromImage(qimg)
-            self._orig_orientation = 'landscape' if w >= h else 'portrait'
-            self._set_thumb(qpix)
-        except Exception:
-            self.thumb.setText("PDF preview failed")
-
-    def _show_quicklook_thumb(self, path: str) -> bool:
-        try:
-            if not is_macos():
-                return False
-            dpr = self.devicePixelRatioF()
-            size = max(256, min(1024, int(512 * dpr)))
-            temp_dir = tempfile.mkdtemp(prefix="luma_ql_")
-            try:
-                subprocess.run(["qlmanage", "-t", "-s", str(size), "-o", temp_dir, path],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-                candidates = [os.path.join(temp_dir, f) for f in os.listdir(temp_dir)
-                              if f.lower().endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff"))]
-                if not candidates:
-                    return False
-                best = max(candidates, key=os.path.getmtime)
-                pix = QPixmap(best)
-                if pix.isNull():
-                    return False
-                self._set_thumb(pix)
-                return True
-            finally:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-        except Exception:
-            return False
-
-    def _show_generic_icon(self, path: str):
-        try:
-            provider = QFileIconProvider()
-            icon = provider.icon(QFileInfo(path))
-            pix = icon.pixmap(256, 256)
-            if pix.isNull(): pix = icon.pixmap(128,128)
-            if not pix.isNull():
-                self._set_thumb(pix)
-                return
-        except Exception:
-            pass
-        self.thumb.setText("No preview")
 
 

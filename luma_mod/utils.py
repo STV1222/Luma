@@ -7,10 +7,18 @@ from PyQt6.QtWidgets import QWidget, QFrame, QMessageBox
 from PyQt6.QtCore import Qt
 
 # ----------------------- constants / config -----------------------
-DEFAULT_FOLDERS = [os.path.expanduser("~/Documents"),
+# User spaces only - exclude system/cache folders
+DEFAULT_FOLDERS = [os.path.expanduser("~/Desktop"),
+                   os.path.expanduser("~/Documents"),
                    os.path.expanduser("~/Downloads"),
-                   os.path.expanduser("~/Desktop")]
-IGNORE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv"}
+                   os.path.expanduser("~/Pictures")]
+
+# Exclude hidden files, caches, system folders
+IGNORE_DIRS = {
+    ".git", "__pycache__", "node_modules", ".venv", "venv", ".Trash",
+    ".DS_Store", ".localized", "Library", "System", "Applications",
+    ".cache", ".tmp", ".temp", "cache", "tmp", "temp"
+}
 MAX_RESULTS = 50
 
 FILETYPE_MAP = {
@@ -63,5 +71,172 @@ def os_open(path: str):
         else: subprocess.run(["xdg-open", path], check=False)
     except Exception as e:
         QMessageBox.warning(None, "Open failed", f"Could not open file:\n{e}")
+
+# ----------------------------- folder matching ----------------------------
+def _folder_similarity(name: str, hint: str) -> float:
+    base = name.lower(); h = hint.lower().strip()
+    if not h:
+        return 0.0
+    if h in base:
+        return 100.0
+    try:
+        from rapidfuzz import fuzz  # type: ignore
+        return float(fuzz.partial_ratio(h, base))
+    except Exception:
+        return 0.0
+
+def find_dirs_by_hint(roots: list[str], hint: str, max_hits: int = 8) -> list[str]:
+    """Search for directories whose basename matches the hint.
+    Only scans under the provided roots, skipping IGNORE_DIRS and hidden dirs.
+    Returns up to max_hits directories sorted by similarity.
+    """
+    if not hint:
+        return []
+    candidates: list[tuple[float, str]] = []
+    # First pass: check immediate children of roots (fast and precise)
+    for root in roots:
+        try:
+            for entry in os.listdir(root):
+                p = os.path.join(root, entry)
+                if os.path.isdir(p) and not entry.startswith('.') and entry not in IGNORE_DIRS:
+                    s = _folder_similarity(entry, hint)
+                    if s > 0:
+                        candidates.append((s, p))
+        except Exception:
+            continue
+    if candidates:
+        top = sorted(candidates, key=lambda x: x[0], reverse=True)[:max_hits]
+        return [p for _s, p in top]
+    # Second pass: deep scan, but avoid over-pruning root levels
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, dirnames, _files in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS and not d.startswith('.')]
+            score = _folder_similarity(os.path.basename(dirpath), hint)
+            if score > 0:
+                candidates.append((score, dirpath))
+            if len(candidates) >= max_hits * 5:
+                # Only prune deeper levels; keep top-level traversal so we don't miss obvious matches
+                try:
+                    depth = os.path.relpath(dirpath, root).count(os.sep)
+                except Exception:
+                    depth = 0
+                if depth >= 1:
+                    dirnames[:] = []
+    top = sorted(candidates, key=lambda x: x[0], reverse=True)[:max_hits]
+    return [p for _s, p in top]
+
+def find_dirs_by_tokens(roots: list[str], tokens: list[str], threshold: float = 85.0, max_hits: int = 3) -> list[str]:
+    """Try to match tokens to immediate child folder names of roots.
+    Returns directories whose basename matches any token with similarity >= threshold.
+    """
+    if not tokens:
+        return []
+    try:
+        from rapidfuzz import fuzz  # type: ignore
+    except Exception:
+        fuzz = None  # type: ignore
+    names = []
+    for root in roots:
+        try:
+            for entry in os.listdir(root):
+                p = os.path.join(root, entry)
+                if os.path.isdir(p) and not entry.startswith('.') and entry not in IGNORE_DIRS:
+                    names.append((entry, p))
+        except Exception:
+            continue
+    hits: list[str] = []
+    for token in tokens:
+        t = token.strip().lower()
+        if not t:
+            continue
+        for entry, path in names:
+            base = entry.lower()
+            sim = 100.0 if t == base else (_folder_similarity(base, t) if fuzz else (100.0 if t in base else 0.0))
+            if sim >= threshold and path not in hits:
+                hits.append(path)
+    return hits[:max_hits]
+
+def find_exact_folder_match(folder_name: str, search_roots: list[str] = None) -> list[str]:
+    """Find exact folder matches using a broader search approach like Raycast.
+    Searches recursively in common locations and user directories for exact folder name matches.
+    """
+    if not folder_name:
+        return []
+    
+    # Define search roots - start with common locations
+    if search_roots is None:
+        search_roots = [
+            os.path.expanduser("~"),  # Home directory
+            os.path.expanduser("~/Desktop"),
+            os.path.expanduser("~/Documents"), 
+            os.path.expanduser("~/Downloads"),
+            os.path.expanduser("~/Pictures"),
+            os.path.expanduser("~/Music"),
+            os.path.expanduser("~/Movies"),
+        ]
+    
+    exact_matches = []
+    folder_lower = folder_name.lower().strip()
+    
+    # First pass: exact matches in immediate children (fastest)
+    for root in search_roots:
+        if not os.path.isdir(root):
+            continue
+        try:
+            for entry in os.listdir(root):
+                if entry.lower() == folder_lower:
+                    path = os.path.join(root, entry)
+                    if os.path.isdir(path) and path not in exact_matches:
+                        exact_matches.append(path)
+        except Exception:
+            continue
+    
+    # If we found exact matches in immediate children, return them
+    if exact_matches:
+        return exact_matches[:3]  # Limit to top 3 exact matches
+    
+    # Second pass: recursive search for exact matches (like Raycast)
+    for root in search_roots:
+        if not os.path.isdir(root):
+            continue
+        try:
+            for dirpath, dirnames, _files in os.walk(root):
+                # Skip hidden directories and common ignore directories
+                dirnames[:] = [d for d in dirnames if not d.startswith('.') and d not in IGNORE_DIRS]
+                
+                # Check if current directory matches
+                current_dir = os.path.basename(dirpath)
+                if current_dir.lower() == folder_lower:
+                    if dirpath not in exact_matches:
+                        exact_matches.append(dirpath)
+                        if len(exact_matches) >= 3:  # Limit to 3 matches
+                            break
+        except Exception:
+            continue
+        
+        if len(exact_matches) >= 3:
+            break
+    
+    # If we found exact matches, return them
+    if exact_matches:
+        return exact_matches[:3]
+    
+    # Third pass: case-insensitive partial matches in immediate children
+    partial_matches = []
+    for root in search_roots:
+        if not os.path.isdir(root):
+            continue
+        try:
+            for entry in os.listdir(root):
+                if folder_lower in entry.lower():
+                    path = os.path.join(root, entry)
+                    if os.path.isdir(path) and path not in partial_matches:
+                        partial_matches.append(path)
+        except Exception:
+            continue
+    
+    return partial_matches[:3]  # Limit to top 3 partial matches
 
 
