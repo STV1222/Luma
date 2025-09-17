@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, platform, math, subprocess
+import os, platform, math, subprocess, re
 from datetime import datetime
 from typing import Optional
 
@@ -71,6 +71,63 @@ def os_open(path: str):
         else: subprocess.run(["xdg-open", path], check=False)
     except Exception as e:
         QMessageBox.warning(None, "Open failed", f"Could not open file:\n{e}")
+
+def make_paths_clickable(text: str) -> str:
+    """Convert file and folder paths in text to clickable HTML links."""
+    # Pattern to match file/folder paths
+    # Matches paths starting with / or ~ or drive letters (Windows)
+    # Also matches relative paths that look like file/folder names
+    path_pattern = r'''
+        (?:
+            # Absolute paths starting with / or ~
+            (?:/|~)[^\s<>"']+ |
+            # Windows drive paths (C:, D:, etc.)
+            [A-Za-z]:[\\/][^\s<>"']+ |
+            # Relative paths that look like files/folders
+            (?:[a-zA-Z0-9_-]+[\\/])*[a-zA-Z0-9_.-]+(?:\.[a-zA-Z0-9]+)?
+        )
+        (?=\s|$|[.,;:!?])
+    '''
+    
+    def replace_path(match):
+        path = match.group(0).strip()
+        
+        # Skip if it looks like a URL or email
+        if path.startswith(('http://', 'https://', 'ftp://', 'mailto:')):
+            return path
+            
+        # Skip if it's just a single word without path separators
+        if '/' not in path and '\\' not in path and not path.startswith('~'):
+            # Only consider it a file if it has an extension
+            if '.' not in path or path.count('.') > 1:
+                return path
+        
+        # Check if the path exists (file or directory)
+        expanded_path = os.path.expanduser(path)
+        if os.path.exists(expanded_path):
+            # Determine if it's a file or folder
+            if os.path.isfile(expanded_path):
+                icon = "📄"
+                action = "openFile"
+            elif os.path.isdir(expanded_path):
+                icon = "📁"
+                action = "openFolder"
+            else:
+                return path
+                
+            # Create clickable link using proper HTML anchor tags
+            if os.path.isfile(expanded_path):
+                href = f"file://{expanded_path}"
+            else:
+                href = f"folder://{expanded_path}"
+            
+            return f'<a href="{href}" style="color: #3b82f6; text-decoration: none; border-bottom: 1px dotted #3b82f6;">{icon} {path}</a>'
+        
+        return path
+    
+    # Apply the pattern with the replacement function
+    result = re.sub(path_pattern, replace_path, text, flags=re.VERBOSE | re.IGNORECASE)
+    return result
 
 # ----------------------------- folder matching ----------------------------
 def _folder_similarity(name: str, hint: str) -> float:

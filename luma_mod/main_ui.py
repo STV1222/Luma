@@ -2,15 +2,91 @@ from __future__ import annotations
 import os
 from typing import Optional, List
 
-from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
-from PyQt6.QtWidgets import QWidget, QFrame, QLineEdit, QComboBox, QListView, QVBoxLayout, QHBoxLayout, QSplitter, QSizePolicy, QTextEdit, QPushButton, QLabel, QStackedLayout
+from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QUrl
+from PyQt6.QtWidgets import QWidget, QFrame, QLineEdit, QComboBox, QListView, QVBoxLayout, QHBoxLayout, QSplitter, QSizePolicy, QTextEdit, QPushButton, QLabel, QStackedLayout, QTextBrowser
+from PyQt6.QtGui import QTextCursor, QMouseEvent, QKeyEvent
 
-from .utils import DEFAULT_FOLDERS, FILETYPE_MAP, divider, center_on_screen, os_open
+from .utils import DEFAULT_FOLDERS, FILETYPE_MAP, divider, center_on_screen, os_open, make_paths_clickable
 from .widgets import BusySpinner, ToggleSwitch, PreviewPane
 from .models import ResultsModel, ResultDelegate, FileHit
 from .ai import LumaAI
 from .search_core import search_files
 from .i18n import get_translation_manager, tr
+
+
+class ChatBrowser(QTextBrowser):
+    """Custom QTextBrowser that can handle clicks on file/folder links."""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setOpenLinks(False)
+        self.setOpenExternalLinks(False)
+        self.setReadOnly(True)
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.LinksAccessibleByMouse)
+        self.anchorClicked.connect(self._on_anchor_clicked)
+        self._current_focused_element = None
+    
+    def _on_anchor_clicked(self, url: QUrl):
+        """Handle single-click on links."""
+        # Find the main UI widget that has the handle_chat_link method
+        widget = self.parent()
+        while widget and not hasattr(widget, 'handle_chat_link'):
+            widget = widget.parent()
+        if widget:
+            widget.handle_chat_link(url, action="preview")
+    
+    def mouseDoubleClickEvent(self, event: QMouseEvent):
+        """Handle double-click on links."""
+        cursor = self.cursorForPosition(event.pos())
+        if cursor.charFormat().isAnchor():
+            href = cursor.charFormat().anchorHref()
+            if href:
+                from PyQt6.QtCore import QUrl
+                # Find the main UI widget that has the handle_chat_link method
+                widget = self.parent()
+                while widget and not hasattr(widget, 'handle_chat_link'):
+                    widget = widget.parent()
+                if widget:
+                    widget.handle_chat_link(QUrl(href), action="open")
+                return
+        super().mouseDoubleClickEvent(event)
+    
+    def keyPressEvent(self, event: QKeyEvent):
+        """Handle keyboard navigation."""
+        if event.key() == Qt.Key.Key_Up or event.key() == Qt.Key.Key_Down:
+            # Navigate through clickable elements
+            self._navigate_results(event.key() == Qt.Key.Key_Down)
+            event.accept()
+        elif event.key() == Qt.Key.Key_Return or event.key() == Qt.Key.Key_Enter:
+            # Open the focused element
+            if self._current_focused_element:
+                from PyQt6.QtCore import QUrl
+                # Find the main UI widget that has the handle_chat_link method
+                widget = self.parent()
+                while widget and not hasattr(widget, 'handle_chat_link'):
+                    widget = widget.parent()
+                if widget:
+                    widget.handle_chat_link(QUrl(self._current_focused_element), action="preview")
+            event.accept()
+        elif event.modifiers() & Qt.KeyboardModifier.ControlModifier and event.key() == Qt.Key.Key_O:
+            # Ctrl+O opens the focused element
+            if self._current_focused_element:
+                from PyQt6.QtCore import QUrl
+                # Find the main UI widget that has the handle_chat_link method
+                widget = self.parent()
+                while widget and not hasattr(widget, 'handle_chat_link'):
+                    widget = widget.parent()
+                if widget:
+                    widget.handle_chat_link(QUrl(self._current_focused_element), action="open")
+            event.accept()
+        else:
+            super().keyPressEvent(event)
+    
+    def _navigate_results(self, down: bool):
+        """Navigate through results using arrow keys."""
+        # This is a simplified implementation
+        # In a full implementation, you'd track all clickable elements and navigate between them
+        pass
 
 
 class SearchWorker(QThread):
@@ -203,6 +279,8 @@ class SpotlightUI(QWidget):
         self.preview=PreviewPane(); self.preview.setVisible(False)
         # Hook summarize button to summarization (fast extractive or deep LLM)
         self.preview.btn_summarize.clicked.connect(self._summarize_selected)
+        # Initially hide summarize button since we start in "No AI" mode
+        self.preview.btn_summarize.setVisible(False)
 
         leftPane = QFrame(); leftPane.setObjectName("leftPane")
         leftLay = QVBoxLayout(leftPane); leftLay.setContentsMargins(0,0,0,0); leftLay.setSpacing(8)
@@ -265,6 +343,8 @@ class SpotlightUI(QWidget):
         self.chat_input.setMinimumHeight(36)
         self.chat_input.setMaximumWidth(400)  # Limit maximum width to prevent pushing mode display off screen
         self.chat_input.returnPressed.connect(self._ask_follow_up)
+        # Add keyboard event handling for Cmd/Ctrl+Enter
+        self.chat_input.keyPressEvent = self._handle_chat_key_press
         
         # Mode display (matching main page style)
         self.mode_display = QLabel("No AI")
@@ -304,21 +384,23 @@ class SpotlightUI(QWidget):
         conversation_widget = QWidget()
         conversation_widget.setObjectName("conversationWidget")
         conv_layout = QVBoxLayout(conversation_widget)
-        conv_layout.setContentsMargins(16, 16, 8, 16)
+        conv_layout.setContentsMargins(0, 0, 0, 0)  # Align with search bar
         conv_layout.setSpacing(0)
         
         # Conversation view with scrollable chat history
-        self.chat_view = QTextEdit()
-        self.chat_view.setReadOnly(True)
+        self.chat_view = ChatBrowser()
         self.chat_view.setObjectName("conversationView")
         self.chat_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.chat_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        
         conv_layout.addWidget(self.chat_view, 1)
         
         # Right side: Preview pane (integrated)
         self.conversation_preview = PreviewPane()
         self.conversation_preview.setObjectName("conversationPreview")
         self.conversation_preview.setVisible(False)
+        # Hook conversation preview summarize button to summarization
+        self.conversation_preview.btn_summarize.clicked.connect(self._summarize_selected)
         
         # Add widgets to splitter
         conversation_splitter.addWidget(conversation_widget)
@@ -554,12 +636,31 @@ class SpotlightUI(QWidget):
             # Switch back to search page
             self.stack.setCurrentIndex(0)
             self._clear_conversation()
+            # Hide summarize button in No AI mode
+            self.preview.btn_summarize.setVisible(False)
+            # Also hide summarize button in conversation preview
+            if hasattr(self, 'conversation_preview'):
+                self.conversation_preview.btn_summarize.setVisible(False)
+            # Update summarize button visibility for both previews
+            self.preview.update_summarize_button_visibility(self.ai_mode)
+            if hasattr(self, 'conversation_preview'):
+                self.conversation_preview.update_summarize_button_visibility(self.ai_mode)
         elif mode_text == "Private Mode":
             self.ai_mode = "private"
             # Reinitialize AI with private mode
             self.ai = LumaAI(mode=self.ai_mode, openai_api_key=self.openai_api_key)
-            # Switch to conversation page
+            # Clear conversation and switch to conversation page
+            self._clear_conversation()
             self._switch_to_conversation_mode()
+            # Show summarize button in Private mode
+            self.preview.btn_summarize.setVisible(True)
+            # Also show summarize button in conversation preview
+            if hasattr(self, 'conversation_preview'):
+                self.conversation_preview.btn_summarize.setVisible(True)
+            # Update summarize button visibility for both previews
+            self.preview.update_summarize_button_visibility(self.ai_mode)
+            if hasattr(self, 'conversation_preview'):
+                self.conversation_preview.update_summarize_button_visibility(self.ai_mode)
             # Warm up the AI mode
             try:
                 QTimer.singleShot(50, self._warmup_ai)
@@ -569,8 +670,18 @@ class SpotlightUI(QWidget):
             self.ai_mode = "cloud"
             # Reinitialize AI with cloud mode
             self.ai = LumaAI(mode=self.ai_mode, openai_api_key=self.openai_api_key)
-            # Switch to conversation page
+            # Clear conversation and switch to conversation page
+            self._clear_conversation()
             self._switch_to_conversation_mode()
+            # Show summarize button in Cloud mode
+            self.preview.btn_summarize.setVisible(True)
+            # Also show summarize button in conversation preview
+            if hasattr(self, 'conversation_preview'):
+                self.conversation_preview.btn_summarize.setVisible(True)
+            # Update summarize button visibility for both previews
+            self.preview.update_summarize_button_visibility(self.ai_mode)
+            if hasattr(self, 'conversation_preview'):
+                self.conversation_preview.update_summarize_button_visibility(self.ai_mode)
             # Warm up the AI mode
             try:
                 QTimer.singleShot(50, self._warmup_ai)
@@ -711,17 +822,49 @@ class SpotlightUI(QWidget):
         
     def _add_user_message(self, message: str):
         """Add user message to conversation."""
-        self.chat_view.append(f"<div style='margin-bottom: 12px;'>")
-        self.chat_view.append(f"<div style='background: #3b82f6; color: white; padding: 8px 12px; border-radius: 12px 12px 4px 12px; display: inline-block; max-width: 80%; margin-left: 20%;'>")
-        self.chat_view.append(f"<strong>You:</strong> {message}")
-        self.chat_view.append(f"</div></div>")
+        from datetime import datetime
+        
+        # Convert file/folder paths to clickable links
+        clickable_message = make_paths_clickable(message)
+        timestamp = datetime.now().strftime("%H:%M")
+        
+        user_bubble_html = f"""
+        <div style='margin-bottom: 16px; display: flex; justify-content: flex-end;'>
+            <div style='background: #3b82f6; color: white; border-radius: 12px; padding: 12px 16px; max-width: 80%; box-shadow: 0 1px 3px rgba(0,0,0,0.1);'>
+                <div style='display: flex; align-items: center; margin-bottom: 4px;'>
+                    <span style='font-weight: 600;'>You</span>
+                    <span style='color: rgba(255,255,255,0.7); font-size: 12px; margin-left: 8px;'>{timestamp}</span>
+                </div>
+                <div style='color: white;'>{clickable_message}</div>
+            </div>
+        </div>
+        """
+        
+        self.chat_view.append(user_bubble_html)
+        
         
     def _add_ai_message(self, message: str):
         """Add AI message to conversation."""
-        self.chat_view.append(f"<div style='margin-bottom: 12px;'>")
-        self.chat_view.append(f"<div style='background: #f1f5f9; color: #1e293b; padding: 8px 12px; border-radius: 12px 12px 12px 4px; display: inline-block; max-width: 80%; margin-right: 20%;'>")
-        self.chat_view.append(f"<strong>AI:</strong> {message}")
-        self.chat_view.append(f"</div></div>")
+        from datetime import datetime
+        
+        # Convert file/folder paths to clickable links
+        clickable_message = make_paths_clickable(message)
+        timestamp = datetime.now().strftime("%H:%M")
+        
+        ai_bubble_html = f"""
+        <div style='margin-bottom: 16px; display: flex; justify-content: flex-start;'>
+            <div style='background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 12px 16px; max-width: 80%; box-shadow: 0 1px 3px rgba(0,0,0,0.1);'>
+                <div style='display: flex; align-items: center; margin-bottom: 8px;'>
+                    <div style='width: 8px; height: 8px; background: #3b82f6; border-radius: 50%; margin-right: 8px;'></div>
+                    <span style='font-weight: 600; color: #1e293b;'>AI</span>
+                    <span style='color: #64748b; font-size: 12px; margin-left: 8px;'>{timestamp}</span>
+                </div>
+                <div style='color: #1e293b;'>{clickable_message}</div>
+            </div>
+        </div>
+        """
+        
+        self.chat_view.append(ai_bubble_html)
         
     def _show_ai_understanding(self, info: dict):
         """Show AI's understanding of user intent to the user."""
@@ -884,7 +1027,7 @@ class SpotlightUI(QWidget):
         self.no_results_widget.setVisible(True)
     
     def _show_results_in_conversation(self, hits: List[FileHit]):
-        """Show search results in conversation mode."""
+        """Show search results in conversation mode as a chat turn."""
         # Add AI response with results
         result_count = len(hits)
         if result_count == 1:
@@ -892,35 +1035,111 @@ class SpotlightUI(QWidget):
         else:
             message = f"Found {result_count} files matching your query:"
         
-        self._add_ai_message(message)
-        
-        # Create a simple file list in the conversation
-        file_list_html = "<div style='margin: 8px 0; padding: 8px; background: #f8fafc; border-radius: 8px; border-left: 3px solid #3b82f6;'>"
-        for i, hit in enumerate(hits):  # Show all results
-            file_name = os.path.basename(hit.path)
-            file_size = self._format_file_size(hit.size)
-            file_date = self._format_file_date(hit.mtime)
-            
-            file_list_html += f"""
-            <div style='margin: 4px 0; padding: 6px; background: white; border-radius: 6px; cursor: pointer; border: 1px solid #e2e8f0;' 
-                 onclick='selectFile("{hit.path}")'>
-                <div style='font-weight: 600; color: #1e293b;'>{file_name}</div>
-                <div style='font-size: 12px; color: #64748b; margin-top: 2px;'>{file_size} • {file_date}</div>
-            </div>
-            """
-        
-        # Removed truncation - show all files
-        
-        file_list_html += "</div>"
-        
-        self.chat_view.append(file_list_html)
+        # Create AI bubble with results
+        self._add_ai_turn_with_results(message, hits)
         
         # Show preview for first file
         if hits:
-            self.conversation_preview.set_file(hits[0].path)
+            self.conversation_preview.set_file(hits[0].path, self.ai_mode)
             self.conversation_preview.show()
             self._current_conversation_hits = hits
             self._current_selected_index = 0
+    
+    def _result_row_html(self, name: str, path: str, meta: str, icon: str) -> str:
+        """Build HTML for a result row with custom link scheme matching main page style."""
+        from urllib.parse import quote
+        encoded_path = quote(path)
+        
+        # Truncate path for display (like main page)
+        display_path = path
+        if len(display_path) > 42:
+            display_path = display_path[:39] + "..."
+        
+        return f"""
+        <div style='display: flex; align-items: center; padding: 8px 8px 8px 24px; margin: 3px 0px 3px 0px; border-radius: 12px; cursor: pointer; transition: background-color 0.2s;' 
+             onmouseover='this.style.backgroundColor="rgba(59, 130, 246, 0.08)"' 
+             onmouseout='this.style.backgroundColor="transparent"'>
+            <a href="luma://select?path={encoded_path}" style='display: flex; align-items: center; width: 100%; text-decoration: none; color: inherit;'>
+                <div style='width: 16px; height: 16px; margin-right: 12px; display: flex; align-items: center; justify-content: center; font-size: 12px;'>{icon}</div>
+                <div style='flex: 1; min-width: 0;'>
+                    <div style='font-weight: 600; color: #1e293b; font-size: 14px; margin-bottom: 2px;'>{name}</div>
+                    <div style='font-size: 12px; color: #64748b;'>{display_path}  •  {meta}</div>
+                </div>
+            </a>
+            </div>
+            """
+        
+    def _add_ai_turn_with_results(self, message: str, hits: List[FileHit]):
+        """Add an AI turn with collapsible folder-grouped results."""
+        from datetime import datetime
+        
+        # Group files by folder
+        folder_groups = {}
+        for hit in hits:
+            folder = os.path.dirname(hit.path)
+            if folder not in folder_groups:
+                folder_groups[folder] = []
+            folder_groups[folder].append(hit)
+        
+        # Create AI bubble HTML
+        timestamp = datetime.now().strftime("%H:%M")
+        
+        # Start AI bubble
+        ai_bubble_html = f"""
+        <div style='margin-bottom: 16px; display: flex; justify-content: flex-start;'>
+            <div style='background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 12px 16px; max-width: 80%; box-shadow: 0 1px 3px rgba(0,0,0,0.1);'>
+                <div style='display: flex; align-items: center; margin-bottom: 8px;'>
+                    <div style='width: 8px; height: 8px; background: #3b82f6; border-radius: 50%; margin-right: 8px;'></div>
+                    <span style='font-weight: 600; color: #1e293b;'>AI</span>
+                    <span style='color: #64748b; font-size: 12px; margin-left: 8px;'>{timestamp}</span>
+                </div>
+                <div style='color: #1e293b; margin-bottom: 12px;'>{message}</div>
+                <div style='background: white; border-radius: 16px; box-shadow: 0 4px 16px rgba(0,0,0,0.08); border: 1px solid rgba(0,0,0,0.08); padding: 0px; margin-top: 8px;'>
+        """
+        
+        # Add all files in a clean list (like main page)
+        for hit in hits:
+            file_name = os.path.basename(hit.path)
+            file_size = self._format_file_size(hit.size)
+            file_date = self._format_file_date(hit.mtime)
+            meta = file_size
+            
+            # Determine file icon based on extension
+            ext = os.path.splitext(hit.path)[1].lower()
+            if ext in ['.pdf']:
+                icon = "📄"
+            elif ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']:
+                icon = "🖼️"
+            elif ext in ['.py']:
+                icon = "🐍"
+            elif ext in ['.js', '.ts', '.jsx', '.tsx']:
+                icon = "⚛️"
+            elif ext in ['.html', '.css']:
+                icon = "🌐"
+            elif ext in ['.doc', '.docx']:
+                icon = "📝"
+            elif ext in ['.xls', '.xlsx']:
+                icon = "📊"
+            elif ext in ['.json']:
+                icon = "📋"
+            elif ext in ['.h', '.cpp', '.c']:
+                icon = "⚙️"
+            elif ext in ['.xcscheme']:
+                icon = "🔧"
+            else:
+                icon = "📄"
+            
+            ai_bubble_html += self._result_row_html(file_name, hit.path, meta, icon)
+        
+        # Close the file list container
+        ai_bubble_html += """
+                </div>
+            </div>
+        </div>
+        """
+        
+        # Append to chat view
+        self.chat_view.append(ai_bubble_html)
     
     def _format_file_size(self, size_bytes: int) -> str:
         """Format file size in human readable format."""
@@ -976,43 +1195,117 @@ class SpotlightUI(QWidget):
         os_open(h.path)
     def _update_preview(self):
         h=self._selected_hit()
-        if h: self.preview.set_file(h.path)
+        print(f"DEBUG: _update_preview called, selected hit: {h}")
+        if h: 
+            print(f"DEBUG: Setting preview file to: {h.path}")
+            self.preview.set_file(h.path, self.ai_mode)
 
     # ---------------- AI Summarization -----------------
     class _SummarizeWorker(QThread):
         summary_ready = pyqtSignal(str)
+        summary_failed = pyqtSignal(str)
         def __init__(self, ai: LumaAI, path: str, use_ai: bool):
             super().__init__(); self.ai=ai; self.path=path; self.use_ai=use_ai
         def run(self):
             try:
                 if self.use_ai:
-                    s = self.ai.summarize_file(self.path) or "Summary unavailable. Check AI mode and dependencies."
+                    s = self.ai.summarize_file(self.path)
+                    if s:
+                        self.summary_ready.emit(s)
+                    else:
+                        self.summary_failed.emit("Summary unavailable. Check AI mode and dependencies.")
                 else:
-                    s = self.ai.summarize_file_extractive(self.path) or "Summary unavailable (no text)."
-            except Exception:
-                s = "Summary failed."
-            self.summary_ready.emit(s)
+                    s = self.ai.summarize_file_extractive(self.path)
+                    if s:
+                        self.summary_ready.emit(s)
+                    else:
+                        self.summary_failed.emit("Summary unavailable (no text).")
+            except Exception as e:
+                self.summary_failed.emit(f"Summary failed: {str(e)}")
 
     def _summarize_selected(self):
+        print(f"DEBUG: _summarize_selected called, ai_mode: {self.ai_mode}")
+        # Only allow summarization in AI modes (private or cloud)
+        if self.ai_mode == "none":
+            print("DEBUG: No AI mode, returning")
+            return
+        
+        # Resolve the target file path to summarize
+        target_path = None
+        # Prefer the file currently shown in the visible preview pane
+        try:
+            if self.stack.currentIndex() == 1 and hasattr(self, 'conversation_preview') and getattr(self.conversation_preview, '_current_file', None):
+                target_path = self.conversation_preview._current_file  # type: ignore[attr-defined]
+                print(f"DEBUG: Using conversation preview current file: {target_path}")
+            elif hasattr(self, 'preview') and getattr(self.preview, '_current_file', None):
+                target_path = self.preview._current_file  # type: ignore[attr-defined]
+                print(f"DEBUG: Using main preview current file: {target_path}")
+        except Exception as e:
+            print(f"DEBUG: Failed reading current preview file: {e}")
+        
         # Check if we're in conversation mode and get the selected file from conversation results
-        if hasattr(self, '_current_conversation_hits') and self._current_conversation_hits and self.stack.currentIndex() == 1:
+        if not target_path and hasattr(self, '_current_conversation_hits') and self._current_conversation_hits and self.stack.currentIndex() == 1:
             # In conversation mode, get the currently selected file from conversation results
             if hasattr(self, '_current_selected_index') and 0 <= self._current_selected_index < len(self._current_conversation_hits):
-                h = self._current_conversation_hits[self._current_selected_index]
+                selected_item = self._current_conversation_hits[self._current_selected_index]
+                # Handle both FileHit objects and string paths
+                if isinstance(selected_item, str):
+                    target_path = selected_item
+                else:
+                    target_path = selected_item.path
             else:
+                # If no file selected in conversation, check if there's a file in the conversation preview
+                if hasattr(self, 'conversation_preview') and getattr(self.conversation_preview, '_current_file', None):
+                    target_path = self.conversation_preview._current_file  # type: ignore[attr-defined]
+        
+        # If still no file found, try main search mode
+        if not target_path:
+            sel = self._selected_hit()
+            print(f"DEBUG: _selected_hit() returned: {sel}")
+            
+            # If still no file, try to get from preview pane
+            if sel:
+                target_path = sel.path
+            elif hasattr(self.preview, '_current_file') and getattr(self.preview, '_current_file', None):
+                target_path = self.preview._current_file  # type: ignore[attr-defined]
+                print(f"DEBUG: Trying to get file from preview pane: {target_path}")
+            else:
+                print(f"DEBUG: Preview pane _current_file: {getattr(self.preview, '_current_file', 'None')}")
+            
+            if not target_path: 
+                print("DEBUG: No file selected for summarization")
                 return
-        else:
-            # In main search mode, get the selected file from the main list
-            h = self._selected_hit()
-            if not h: 
-                return
-        # Open chat page immediately with running indicator
-        self._current_chat_file = h.path
-        self.lbl_chat_title.setText(os.path.basename(h.path))
-        self.chat_view.clear(); self.chat_view.append("Summarizing…\n")
-        self.stack.setCurrentIndex(1)
+        
+        if not target_path:
+            print("DEBUG: Missing target_path for summarization")
+            return
+        
+        print(f"DEBUG: Summarizing file: {target_path}")
+        
+        # Switch to conversation mode if not already there
+        if self.stack.currentIndex() != 1:
+            self.stack.setCurrentIndex(1)
+            self._update_conversation_mode_indicator()
+        
+        # Add user message about summarization request to chat
+        self._add_user_message(f"Please summarize {os.path.basename(target_path)}")
+        
+        # Add AI processing message to chat
+        self._add_ai_message("Summarizing...")
+        
+        # Show loading indicator in chat
         self.chat_spinner.start()
-        self.preview.summary.setVisible(False)
+        
+        # Determine which preview pane to use for button state
+        if self.stack.currentIndex() == 1:  # Conversation mode
+            preview_pane = self.conversation_preview
+        else:  # Search mode
+            preview_pane = self.preview
+        
+        # Disable the summarize button during processing
+        preview_pane.btn_summarize.setEnabled(False)
+        preview_pane.btn_summarize.setText("Processing...")
+        
         # Use the selected mode for summarization
         if self.ai_mode == "none":
             use_ai = False  # Use extractive summarization
@@ -1020,35 +1313,85 @@ class SpotlightUI(QWidget):
             use_ai = True   # Use OpenAI API
         else:  # private mode
             use_ai = self.ai._ensure_ollama()  # Use local AI if available, otherwise extractive
-        self._sum_worker = self._SummarizeWorker(self.ai, h.path, use_ai)
-        self._sum_worker.summary_ready.connect(lambda text, path=h.path, name=os.path.basename(h.path): self._open_chat_with_summary(name, path, text))
+        
+        self._sum_worker = self._SummarizeWorker(self.ai, target_path, use_ai)
+        self._sum_worker.summary_ready.connect(lambda text, path=target_path, name=os.path.basename(target_path): self._display_summary_in_preview(name, path, text))
+        self._sum_worker.summary_failed.connect(lambda error_msg: self._handle_summarize_error(error_msg))
         self._sum_worker.start()
-        # Show a hint if the operation takes too long (mainly for AI mode)
-        def _slow_hint():
-            if getattr(self, "_sum_worker", None) and self._sum_worker.isRunning():
-                if self.ai_mode == "cloud":
-                    self.chat_view.append("This is taking longer than usual. Cloud Mode is processing...\n")
-                elif self.ai_mode == "private":
-                    self.chat_view.append("This is taking longer than usual. Private Mode is processing...\n")
-                else:
-                    self.chat_view.append("This is taking longer than usual. Processing...\n")
-        QTimer.singleShot(2500, _slow_hint)
+
+    def _display_summary_in_preview(self, name: str, path: str, summary: str):
+        """Display the summary in the chat area."""
+        # Stop the chat spinner
+        self.chat_spinner.stop()
+        
+        # Determine which preview pane to use for button state
+        if self.stack.currentIndex() == 1:  # Conversation mode
+            preview_pane = self.conversation_preview
+        else:  # Search mode
+            preview_pane = self.preview
+        
+        # Restore button state
+        preview_pane.btn_summarize.setEnabled(True)
+        preview_pane.btn_summarize.setText("Summarize")
+        
+        # Replace the "Summarizing..." message with the actual summary in chat
+        current_html = self.chat_view.toHtml()
+        
+        if summary and summary.strip():
+            summary_html = f"Here's a summary of {name}:\n\n{summary}"
+        else:
+            summary_html = f"Summary unavailable for {name}. The file may not contain text content suitable for summarization."
+        
+        # Replace the "Summarizing..." message with the summary
+        updated_html = current_html.replace("Summarizing...", summary_html)
+        
+        # Update the chat view with the new content
+        self.chat_view.setHtml(updated_html)
+
+    def _handle_summarize_error(self, error_msg: str):
+        """Handle summarization errors."""
+        # Stop the chat spinner
+        self.chat_spinner.stop()
+        
+        # Determine which preview pane to use for button state
+        if self.stack.currentIndex() == 1:  # Conversation mode
+            preview_pane = self.conversation_preview
+        else:  # Search mode
+            preview_pane = self.preview
+        
+        # Restore button state
+        preview_pane.btn_summarize.setEnabled(True)
+        preview_pane.btn_summarize.setText("Summarize")
+        
+        # Replace the "Summarizing..." message with error in chat
+        current_html = self.chat_view.toHtml()
+        error_html = f"Error: {error_msg}"
+        updated_html = current_html.replace("Summarizing...", error_html)
+        
+        # Update the chat view with the error message
+        self.chat_view.setHtml(updated_html)
 
     def _open_chat_with_summary(self, name: str, path: str, summary: str):
         self.chat_spinner.stop()
         self._current_chat_file = path
-        self.lbl_chat_title.setText(name)
-        self.chat_view.clear()
         
         # Switch to conversation mode
         self.stack.setCurrentIndex(1)
         self._update_conversation_mode_indicator()
         
-        # Add AI message with summary
-        self._add_ai_message(f"Here's a summary of {name}:\n\n{summary}")
+        # Replace the "Summarizing…" message with the actual summary
+        # Get the current HTML content
+        current_html = self.chat_view.toHtml()
+        
+        # Replace the "Summarizing…" message with the summary
+        summary_html = f"Here's a summary of {name}:\n\n{summary}"
+        updated_html = current_html.replace("Summarizing…", summary_html)
+        
+        # Update the chat view with the new content
+        self.chat_view.setHtml(updated_html)
         
         # Show file in preview
-        self.conversation_preview.set_file(path)
+        self.conversation_preview.set_file(path, self.ai_mode)
         self.conversation_preview.show()
 
     class _QnAWorker(QThread):
@@ -1061,6 +1404,60 @@ class SpotlightUI(QWidget):
             except Exception:
                 a = "Question failed."
             self.answer_ready.emit(a)
+
+    def _handle_chat_key_press(self, event: QKeyEvent):
+        """Handle keyboard events in chat input."""
+        if (event.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier) and 
+            event.key() == Qt.Key.Key_Return):
+            # Cmd/Ctrl+Enter submits the query
+            self._ask_follow_up()
+            event.accept()
+        else:
+            # Call the original keyPressEvent
+            QLineEdit.keyPressEvent(self.chat_input, event)
+    
+    def handle_chat_link(self, url: QUrl, action="preview"):
+        """Handle clicks on chat links."""
+        from urllib.parse import parse_qs, unquote
+        import subprocess
+        import platform
+        
+        # Parse the custom luma:// URL scheme
+        if url.scheme() == "luma":
+            if url.host() == "select":
+                path = unquote(parse_qs(url.query()).get("path", [""])[0])
+                if action == "open":
+                    # Open in OS
+                    if platform.system() == "Windows":
+                        os.startfile(path)  # type: ignore
+                    elif platform.system() == "Darwin":  # macOS
+                        subprocess.Popen(["open", path])
+                    else:  # Linux
+                        subprocess.Popen(["xdg-open", path])
+                else:
+                    # Show preview
+                    self._show_preview_for(path)
+    
+    def _show_preview_for(self, path: str):
+        """Show preview for the given file path."""
+        if hasattr(self, 'conversation_preview'):
+            self.conversation_preview.set_file(path, self.ai_mode)
+            self.conversation_preview.show()
+            # Update the current selection
+            self._current_selected_index = 0
+            # Create FileHit object from path
+            try:
+                from .models import FileHit
+                stat_info = os.stat(path)
+                file_hit = FileHit(
+                    path=path,
+                    name=os.path.basename(path),
+                    size=stat_info.st_size,
+                    mtime=stat_info.st_mtime
+                )
+                self._current_conversation_hits = [file_hit]
+            except Exception:
+                self._current_conversation_hits = []
 
     def _ask_follow_up(self):
         q = self.chat_input.text().strip()
@@ -1101,13 +1498,27 @@ class SpotlightUI(QWidget):
     
     def _go_back_from_conversation(self):
         """Handle back button from conversation mode."""
-        # Keep the current AI mode (private or cloud) - don't reset to No AI
+        # Switch back to No AI mode since main page only supports No AI
+        self.ai_mode = "none"
         # Switch back to search mode
         self.stack.setCurrentIndex(0)
+        # Hide summarize button since we're in No AI mode
+        self.preview.btn_summarize.setVisible(False)
+        # Also hide summarize button in conversation preview
+        if hasattr(self, 'conversation_preview'):
+            self.conversation_preview.btn_summarize.setVisible(False)
+        # Update summarize button visibility for both previews
+        self.preview.update_summarize_button_visibility(self.ai_mode)
+        if hasattr(self, 'conversation_preview'):
+            self.conversation_preview.update_summarize_button_visibility(self.ai_mode)
         # Resize back to search mode
         self.resize(700, 160)
         self.setMinimumSize(700, 160)
         self.setMaximumSize(700, 800)
+        # Update UI texts to reflect No AI mode
+        self._update_ui_texts()
+        # Update mode display after a short delay to ensure it's not overridden
+        QTimer.singleShot(100, self._update_conversation_mode_indicator)
 
     def _apply_style(self):
         self.setStyleSheet("""
@@ -1215,18 +1626,42 @@ class SpotlightUI(QWidget):
         }
         
         QWidget#conversationWidget {
-            background: #f8fafc;
+            background: #ffffff;
             border-radius: 0px;
         }
         
         QTextEdit#conversationView {
-            background: #f8fafc;
+            background: #ffffff;
             border: none;
             border-radius: 0px;
             padding: 16px;
             color: #1e293b;
             font-size: 14px;
             line-height: 1.5;
+        }
+        
+        /* Chat bubble styling */
+        QTextEdit#conversationView a {
+            text-decoration: none;
+            color: #3b82f6;
+        }
+        
+        QTextEdit#conversationView a:hover {
+            text-decoration: underline;
+        }
+        
+        /* Button styling within chat */
+        QTextEdit#conversationView button {
+            background: #f1f5f9;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            padding: 4px 8px;
+            font-size: 11px;
+            color: #374151;
+        }
+        
+        QTextEdit#conversationView button:hover {
+            background: #e5e7eb;
         }
         
         QLineEdit#mainChatInput {

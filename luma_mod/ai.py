@@ -115,12 +115,18 @@ class LumaAI:
         return True
     
     def _ensure_openai(self) -> bool:
-        if not HAVE_OPENAI or not self.openai_api_key:
+        if not HAVE_OPENAI:
+            print("DEBUG: OpenAI not available - install with: pip install openai")
+            return False
+        if not self.openai_api_key:
+            print("DEBUG: OpenAI API key not set")
             return False
         if self._openai_client is None:
             try:
                 self._openai_client = OpenAI(api_key=self.openai_api_key)
-            except Exception:
+                print("DEBUG: OpenAI client initialized successfully")
+            except Exception as e:
+                print(f"DEBUG: Failed to initialize OpenAI client: {e}")
                 return False
         return True
     
@@ -128,20 +134,29 @@ class LumaAI:
         """Invoke the appropriate AI model based on current mode."""
         if self.mode == "cloud" and self._ensure_openai():
             try:
+                print("DEBUG: Calling OpenAI API...")
                 response = self._openai_client.chat.completions.create(
-                    model="gpt-5-nano",
+                    model="gpt-4o-mini",  # Fixed model name
                     messages=[{"role": "user", "content": prompt}],
                     max_tokens=1000,
                     temperature=0.1
                 )
-                return response.choices[0].message.content.strip()
-            except Exception:
+                result = response.choices[0].message.content.strip()
+                print(f"DEBUG: OpenAI response received: {len(result)} characters")
+                return result
+            except Exception as e:
+                print(f"DEBUG: OpenAI API call failed: {e}")
                 return ""
         elif self.mode == "private" and self._ensure_ollama():
             try:
-                return self._model.invoke(prompt).strip()
-            except Exception:
+                print("DEBUG: Calling Ollama...")
+                result = self._model.invoke(prompt).strip()
+                print(f"DEBUG: Ollama response received: {len(result)} characters")
+                return result
+            except Exception as e:
+                print(f"DEBUG: Ollama call failed: {e}")
                 return ""
+        print("DEBUG: No AI model available")
         return ""
 
     def parse_query_nonai(self, query: str) -> Dict[str, Any]:
@@ -473,11 +488,15 @@ class LumaAI:
             return None
 
     def summarize_file(self, path: str, max_chars: int = 10_000) -> Optional[str]:
+        print(f"DEBUG: summarize_file called for {path}")
         if not self._ensure():
+            print("DEBUG: AI model not available")
             return None
         text = extract_text_from_file(path)
         if not text:
+            print("DEBUG: No text extracted from file")
             return None
+        print(f"DEBUG: Extracted {len(text)} characters from file")
         text = text[:max_chars]
         prompt = (
             "You are a helpful assistant. Read the following file content and produce a very concise summary in at most 3 sentences. "
@@ -486,8 +505,14 @@ class LumaAI:
         )
         try:
             out = self._invoke_ai(prompt)
-            return out.strip()
-        except Exception:
+            if out:
+                print(f"DEBUG: Summary generated: {len(out)} characters")
+                return out.strip()
+            else:
+                print("DEBUG: Empty response from AI")
+                return None
+        except Exception as e:
+            print(f"DEBUG: Exception in summarize_file: {e}")
             return None
 
     def answer_about_file(self, path: str, question: str, max_chars: int = 12_000) -> Optional[str]:

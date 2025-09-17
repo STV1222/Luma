@@ -277,7 +277,7 @@ class PreviewPane(QWidget):
         self.summary = QTextEdit(); self.summary.setReadOnly(True); self.summary.setVisible(False)
         root.addWidget(self.summary, 2)
 
-    def set_file(self, path: Optional[str]):
+    def set_file(self, path: Optional[str], ai_mode: str = "none"):
         # Stop any existing worker
         if self._current_worker and self._current_worker.isRunning():
             self._current_worker.stop()
@@ -286,6 +286,7 @@ class PreviewPane(QWidget):
         self.thumb.clear()
         for _,v in self._rows: v.setText("—")
         self.summary.clear(); self.summary.setVisible(False); self.btn_summarize.setVisible(False)
+        self._current_file = path  # Store current file path
         if not path: return
         
         try:
@@ -311,8 +312,8 @@ class PreviewPane(QWidget):
         # Show loading message
         self.thumb.setText(tr("loading_preview"))
         
-        # Show summarize button for text-like and supported doc types
-        if (ext in TEXT_EXTS) or (ext in {".pdf",".docx",".pptx"}):
+        # Show summarize button only for text-like and supported doc types AND when AI mode is enabled
+        if ((ext in TEXT_EXTS) or (ext in {".pdf",".docx",".pptx"})) and ai_mode != "none":
             self.btn_summarize.setVisible(True)
     
     def _on_preview_ready(self, path: str, pixmap: QPixmap, orientation: str):
@@ -323,6 +324,17 @@ class PreviewPane(QWidget):
     def _on_preview_failed(self, path: str, error_message: str):
         """Handle failed preview generation."""
         self.thumb.setText(f"{tr('preview_failed')}: {error_message}")
+
+    def update_summarize_button_visibility(self, ai_mode: str):
+        """Update the summarize button visibility based on AI mode."""
+        if ai_mode == "none":
+            self.btn_summarize.setVisible(False)
+        else:
+            # Only show if we have a file and it's a supported type
+            if hasattr(self, '_current_file') and self._current_file:
+                ext = os.path.splitext(self._current_file)[1].lower()
+                if (ext in TEXT_EXTS) or (ext in {".pdf",".docx",".pptx"}):
+                    self.btn_summarize.setVisible(True)
 
     def resizeEvent(self, ev):
         super().resizeEvent(ev); self._fit_thumb()
