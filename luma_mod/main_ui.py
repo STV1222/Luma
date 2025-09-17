@@ -3,11 +3,11 @@ import os
 from typing import Optional, List
 
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QUrl
-from PyQt6.QtWidgets import QWidget, QFrame, QLineEdit, QComboBox, QListView, QVBoxLayout, QHBoxLayout, QSplitter, QSizePolicy, QTextEdit, QPushButton, QLabel, QStackedLayout, QTextBrowser
-from PyQt6.QtGui import QTextCursor, QMouseEvent, QKeyEvent
+from PyQt6.QtWidgets import QWidget, QFrame, QLineEdit, QComboBox, QListView, QVBoxLayout, QHBoxLayout, QSplitter, QSizePolicy, QTextEdit, QPushButton, QLabel, QStackedLayout, QTextBrowser, QFileDialog, QDialog, QListWidget, QDialogButtonBox
+from PyQt6.QtGui import QTextCursor, QMouseEvent, QKeyEvent, QGuiApplication
 
 from .utils import DEFAULT_FOLDERS, FILETYPE_MAP, divider, center_on_screen, os_open, make_paths_clickable
-from .widgets import BusySpinner, ToggleSwitch, PreviewPane
+from .widgets import BusySpinner, ToggleSwitch, PreviewPane, LoadingOverlay
 from .models import ResultsModel, ResultDelegate, FileHit
 from .ai import LumaAI
 from .search_core import search_files
@@ -147,6 +147,8 @@ class SpotlightUI(QWidget):
         self.setMinimumSize(700, 160)  # Increased height to prevent squeezing
         self.setMaximumSize(700, 800)  # Keep consistent width, only height changes
         self._folders=DEFAULT_FOLDERS[:]
+        self._turn_idx = 0
+        self._rag_folders: List[str] = []
         self._worker: Optional[SearchWorker]=None
         self._ai_worker: Optional[AIWorker]=None
         # Initialize AI with default mode and API key
@@ -185,6 +187,19 @@ class SpotlightUI(QWidget):
         spinner_layout.setSpacing(0)
         self.spinner_holder.setFixedWidth(50)
         
+        # Folder chooser button next to spinner
+        self.folder_btn = QPushButton("Folders")
+        self.folder_btn.setObjectName("aiModeButton")
+        self.folder_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.folder_btn.setFixedWidth(90)
+        self.folder_btn.setFixedHeight(36)
+        self.folder_btn.clicked.connect(self._toggle_folder_dropdown)
+        # Small chip showing current folder scope
+        self.folder_chip = QLabel("All folders")
+        self.folder_chip.setObjectName("folderChip")
+        self.folder_chip.setToolTip("RAG searches all indexed folders")
+        self.folder_chip.setFixedHeight(36)
+        
         # Add settings button to search bar (custom logo)
         self.settings_btn = QPushButton()
         self.settings_btn.setObjectName("settingsButton")
@@ -211,6 +226,8 @@ class SpotlightUI(QWidget):
         search_layout.addWidget(self.search, 1)
         search_layout.addWidget(self.ai_mode_button, 0)
         search_layout.addWidget(self.spinner_holder, 0)
+        search_layout.addWidget(self.folder_btn, 0)
+        search_layout.addWidget(self.folder_chip, 0)
         search_layout.addWidget(self.settings_btn, 0)
         
         # Create dropdown menu for AI modes as a popup window
@@ -245,6 +262,39 @@ class SpotlightUI(QWidget):
         dropdown_layout.addWidget(self.no_ai_btn)
         dropdown_layout.addWidget(self.private_mode_btn)
         dropdown_layout.addWidget(self.cloud_mode_btn)
+        
+        # Quick folder dropdown (lists known folders; allows open dialog)
+        self.folder_dropdown = QWidget()
+        self.folder_dropdown.setObjectName("aiDropdown")
+        self.folder_dropdown.setVisible(False)
+        self.folder_dropdown.setFixedSize(320, 240)
+        self.folder_dropdown.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint | 
+            Qt.WindowType.Popup | 
+            Qt.WindowType.WindowStaysOnTopHint
+        )
+        fd_lay = QVBoxLayout(self.folder_dropdown); fd_lay.setContentsMargins(8,8,8,8); fd_lay.setSpacing(6)
+        self.lbl_folder_hint = QLabel("Choose folders for RAG. Recently used and defaults shown:"); self.lbl_folder_hint.setStyleSheet("color:#e5e7eb; font-size:12px;")
+        fd_lay.addWidget(self.lbl_folder_hint)
+        self.folder_list = QListWidget(); self.folder_list.setSelectionMode(self.folder_list.SelectionMode.ExtendedSelection)
+        fd_lay.addWidget(self.folder_list)
+        row = QHBoxLayout(); self.btn_add_folder = QPushButton("Add…"); self.btn_use_selected = QPushButton("Use"); self.btn_use_all = QPushButton("Use all"); row.addWidget(self.btn_add_folder); row.addStretch(1); row.addWidget(self.btn_use_all); row.addWidget(self.btn_use_selected)
+        fd_lay.addLayout(row)
+        self.btn_add_folder.clicked.connect(self._add_folder_to_list)
+        self.btn_use_selected.clicked.connect(self._apply_selected_folders)
+        self.btn_use_all.clicked.connect(self._apply_all_folders)
+
+        # Reuse the same dropdown for chat header button
+        def _toggle_chat_folder_dropdown():
+            is_visible = self.folder_dropdown.isVisible()
+            if is_visible:
+                self.folder_dropdown.setVisible(False)
+            else:
+                g = self.chat_folder_btn.mapToGlobal(self.chat_folder_btn.rect().bottomLeft())
+                self.folder_dropdown.move(g.x(), g.y() + 4)
+                self._update_ui_texts()
+                self.folder_dropdown.setVisible(True)
+        self._toggle_folder_dropdown_chat = _toggle_chat_folder_dropdown
         
         # Spinner for loading states (now in the spinner holder)
         self.spinner = BusySpinner(16)  # Slightly smaller for the compact space
@@ -353,6 +403,21 @@ class SpotlightUI(QWidget):
         self.mode_display.setFixedHeight(36)  # Match other elements height
         self.mode_display.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.mode_display.setMinimumWidth(140)  # Ensure minimum width
+
+        # Chat header folder scope controls (hidden by default; only for AI modes)
+        self.chat_folder_btn = QPushButton("Folders")
+        self.chat_folder_btn.setObjectName("aiModeButton")
+        self.chat_folder_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.chat_folder_btn.setFixedWidth(90)
+        self.chat_folder_btn.setFixedHeight(36)
+        self.chat_folder_btn.clicked.connect(self._toggle_folder_dropdown_chat)
+        self.chat_folder_btn.setVisible(False)
+
+        self.chat_folder_chip = QLabel("All folders")
+        self.chat_folder_chip.setObjectName("folderChip")
+        self.chat_folder_chip.setToolTip("RAG searches all indexed folders")
+        self.chat_folder_chip.setVisible(False)
+        self.chat_folder_chip.setFixedHeight(36)
         
         # Spinner holder for loading animation
         self.chat_spinner_holder = QWidget()
@@ -372,6 +437,8 @@ class SpotlightUI(QWidget):
         head.addWidget(self.btn_back, 0)  # Fixed size
         head.addWidget(self.chat_input, 1)  # Flexible size
         head.addWidget(self.mode_display, 0)  # Fixed size
+        head.addWidget(self.chat_folder_btn, 0)
+        head.addWidget(self.chat_folder_chip, 0)
         head.addWidget(self.chat_spinner_holder, 0)  # Fixed size
         
         cp_lay.addWidget(header_widget)
@@ -410,6 +477,8 @@ class SpotlightUI(QWidget):
         conversation_splitter.setSizes([400, 300])
         
         cp_lay.addWidget(conversation_splitter, 1)
+        # Global loading overlay for chat page
+        self.chat_overlay = LoadingOverlay(self.chat_page)
 
         # Settings page (index 2)
         self.settings_page = QWidget()
@@ -606,6 +675,65 @@ class SpotlightUI(QWidget):
             # Cancel any pending hide timer when showing
             if hasattr(self, '_dropdown_hide_timer'):
                 self._dropdown_hide_timer.stop()
+
+    def _toggle_folder_dropdown(self):
+        is_visible = self.folder_dropdown.isVisible()
+        if is_visible:
+            self.folder_dropdown.setVisible(False)
+        else:
+            # position under button
+            g = self.folder_btn.mapToGlobal(self.folder_btn.rect().bottomLeft())
+            self.folder_dropdown.move(g.x(), g.y() + 4)
+            # refresh list
+            self._update_ui_texts()
+            self.folder_dropdown.setVisible(True)
+
+    def _add_folder_to_list(self):
+        path = QFileDialog.getExistingDirectory(self, "Choose folder", os.path.expanduser("~"))
+        if path:
+            if path not in self._rag_folders:
+                self._rag_folders.append(path)
+                self.folder_list.addItem(path)
+
+    def _apply_selected_folders(self):
+        selected = [self.folder_list.item(i).text() for i in range(self.folder_list.count()) if self.folder_list.item(i).isSelected()]
+        if not selected:
+            selected = [self.folder_list.item(i).text() for i in range(self.folder_list.count())]
+        self._rag_folders = selected
+        try:
+            from luma_mod.rag.service import ensure_index_started
+            # Replace index with the newly selected folders to strictly scope RAG
+            ensure_index_started(self._rag_folders, exclude=["node_modules", "__pycache__", ".git"], replace=True)
+            self._add_ai_message("Indexing (fresh) started for selected folders. RAG will only use these folders.")
+        except Exception:
+            pass
+        # Update chips in both search header and chat header
+        self._update_folder_chips()
+        self.folder_dropdown.setVisible(False)
+
+    def _update_folder_chips(self):
+        """Sync folder scope chips (search bar and chat header) with current selection."""
+        try:
+            if len(self._rag_folders) == 0:
+                label = "All folders"; tooltip = "RAG searches all indexed folders"
+            elif len(self._rag_folders) == 1:
+                import os as _os
+                base = _os.path.basename(self._rag_folders[0]) or self._rag_folders[0]
+                label = base; tooltip = self._rag_folders[0]
+            else:
+                label = f"{len(self._rag_folders)} folders"; tooltip = "\n".join(self._rag_folders)
+            if hasattr(self, 'folder_chip'):
+                self.folder_chip.setText(label); self.folder_chip.setToolTip(tooltip)
+            if hasattr(self, 'chat_folder_chip'):
+                self.chat_folder_chip.setText(label); self.chat_folder_chip.setToolTip(tooltip)
+        except Exception:
+            pass
+
+    def _apply_all_folders(self):
+        """Switch back to using all indexed folders (clears explicit selection)."""
+        self._rag_folders = []
+        self._update_folder_chips()
+        self.folder_dropdown.setVisible(False)
     
     def _on_dropdown_hover(self, event):
         """Keep dropdown open when hovering over it."""
@@ -645,6 +773,11 @@ class SpotlightUI(QWidget):
             self.preview.update_summarize_button_visibility(self.ai_mode)
             if hasattr(self, 'conversation_preview'):
                 self.conversation_preview.update_summarize_button_visibility(self.ai_mode)
+            # Hide folder controls in No AI mode
+            if hasattr(self, 'folder_btn'):
+                self.folder_btn.setVisible(False)
+            if hasattr(self, 'folder_chip'):
+                self.folder_chip.setVisible(False)
         elif mode_text == "Private Mode":
             self.ai_mode = "private"
             # Reinitialize AI with private mode
@@ -661,6 +794,16 @@ class SpotlightUI(QWidget):
             self.preview.update_summarize_button_visibility(self.ai_mode)
             if hasattr(self, 'conversation_preview'):
                 self.conversation_preview.update_summarize_button_visibility(self.ai_mode)
+            # Show folder controls in AI modes
+            if hasattr(self, 'folder_btn'):
+                self.folder_btn.setVisible(True)
+            if hasattr(self, 'folder_chip'):
+                self.folder_chip.setVisible(True)
+            # Show folder controls in AI modes
+            if hasattr(self, 'chat_folder_btn'):
+                self.chat_folder_btn.setVisible(True)
+            if hasattr(self, 'chat_folder_chip'):
+                self.chat_folder_chip.setVisible(True)
             # Warm up the AI mode
             try:
                 QTimer.singleShot(50, self._warmup_ai)
@@ -682,6 +825,16 @@ class SpotlightUI(QWidget):
             self.preview.update_summarize_button_visibility(self.ai_mode)
             if hasattr(self, 'conversation_preview'):
                 self.conversation_preview.update_summarize_button_visibility(self.ai_mode)
+            # Show folder controls in AI modes
+            if hasattr(self, 'folder_btn'):
+                self.folder_btn.setVisible(True)
+            if hasattr(self, 'folder_chip'):
+                self.folder_chip.setVisible(True)
+            # Show folder controls in AI modes
+            if hasattr(self, 'chat_folder_btn'):
+                self.chat_folder_btn.setVisible(True)
+            if hasattr(self, 'chat_folder_chip'):
+                self.chat_folder_chip.setVisible(True)
             # Warm up the AI mode
             try:
                 QTimer.singleShot(50, self._warmup_ai)
@@ -723,6 +876,8 @@ class SpotlightUI(QWidget):
         # Get AI understanding for intelligent search
         semantic_keywords = info.get("semantic_keywords", [])
         file_patterns = info.get("file_name_patterns", [])
+        # Remember keywords for conditional rerank logic
+        self._last_keywords = kws[:]
         
         if self._worker and self._worker.isRunning():
             self._worker.requestInterruption(); self._worker.quit(); self._worker.wait(50)
@@ -731,12 +886,13 @@ class SpotlightUI(QWidget):
         self._last_time_range = tr
         self._last_file_types = allow_exts
         self._last_folders = target_folders
+        self._last_folder_depth = info.get("folder_depth", "any")
         
         self._worker=SearchWorker(target_folders, kws, allow_exts, tr, tattr, semantic_keywords, file_patterns)
         if self.ai_mode != "none":
             self._worker.results_ready.connect(lambda hits, q=self.search.text().strip(): self._maybe_rerank(q, hits))
         else:
-            self._worker.results_ready.connect(self._apply_hits)
+            self._worker.results_ready.connect(lambda hits: self._apply_hits(self._conditioned_rerank(hits)))
         self._worker.start()
 
     def _perform_search(self):
@@ -747,12 +903,71 @@ class SpotlightUI(QWidget):
             return
         
         if self.ai_mode == "none":
-            # Use non-AI keyword-based search
+            # No AI: never use RAG; always local filename listing with strict ext when user says ppt/powerpoint
             info = self.ai.parse_query_nonai(q)
+            import re as _re
+            if _re.search(r"\b(pptx?|power\s*point|powerpoint)\b", q, _re.IGNORECASE):
+                allow_exts = ['.ppt', '.pptx']
+                info['file_types'] = allow_exts
             self._start_search_with_info(info, "User")
         else:
             # For AI modes, switch to conversation and handle the query there
             self._switch_to_conversation_mode()
+            # In AI modes: if cross-doc, run RAG; else do AI-assisted listing
+            route = self.ai.route_query(q)
+            if route == "rag":
+                try:
+                    self.chat_view.clear()
+                    self.chat_view.append("<div style='margin:6px 0 12px 0; color:#6b7280;'>Asking across your documents…</div>")
+                    res = self.ai.crossdoc_answer(q, n_ctx=12)
+                    ans = (res.get("answer") or "").replace("\n","<br>")
+                    hits = res.get("hits", [])
+                    low = bool(res.get("low_confidence", False))
+                    self._add_ai_message(ans)
+                    for i, (score, meta) in enumerate(hits, start=1):
+                        path = str(meta.get("path", ""))
+                        page = meta.get("page")
+                        tag = f"{path}:p{page}" if page else path
+                        snippet = str(meta.get("text", ""))[:320].replace("\n", " ")
+                        card_html = (
+                            f"<div style='border:1px solid #e5e7eb; border-radius:10px; padding:10px; margin:8px 20% 8px 0;'>"
+                            f"<div style='font-weight:600; margin-bottom:6px;'>[{i}] {tag}</div>"
+                            f"<div style='color:#374151; font-size:0.95em;'>{snippet}</div>"
+                            f"</div>"
+                        )
+                        self.chat_view.append(card_html)
+                    # Append structured Sources block
+                    if hits:
+                        sources_html = "<div style='margin:8px 0 4px 0; color:#6b7280; font-weight:600;'>Sources</div>"
+                        self.chat_view.append(sources_html)
+                        for i, (score, meta) in enumerate(hits, start=1):
+                            path = str(meta.get("path", ""))
+                            page = meta.get("page")
+                            tag = f"{path}:p{page}" if page else path
+                            from urllib.parse import quote
+                            qp = quote(path)
+                            snippet = str(meta.get("text", ""))[:220].replace("\n", " ")
+                            block = (
+                                f"<div style='border:1px solid #e5e7eb; border-radius:10px; padding:10px; margin:6px 20% 6px 0;'>"
+                                f"<div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;'>"
+                                f"<div style='font-weight:600;'>[{i}] {tag}</div>"
+                                f"<div>"
+                                f"<a href='luma://select?path={qp}' style='margin-right:8px;'>Preview</a>"
+                                f"<a href='luma://select?path={qp}' onclick='return false;' style='margin-right:0;'>Open</a>"
+                                f"</div>"
+                                f"</div>"
+                                f"<div style='color:#374151; font-size:0.95em;'>{snippet}</div>"
+                                f"</div>"
+                            )
+                            self.chat_view.append(block)
+                    if low:
+                        self.chat_view.append(
+                            "<div style='background:#fef3c7; color:#92400e; padding:10px; border-radius:10px; border-left:4px solid #f59e0b; margin:8px 20% 0 0;'>Not enough info in your files</div>"
+                        )
+                    return
+                except Exception:
+                    # If RAG fails, fallback to AI listing flow
+                    pass
             self._handle_ai_query(q)
 
     def _switch_to_conversation_mode(self):
@@ -803,11 +1018,70 @@ class SpotlightUI(QWidget):
         # Add user query to conversation
         self._add_user_message(query)
         
-        # Show loading indicator
+        # Show loading indicator (overlay + small spinner)
         self.chat_spinner.start()
+        self._show_loading("AI is thinking…")
         self.chat_view.append("AI is thinking…\n")
         
-        # Process the query with AI
+        # Route: cross-document questions use RAG; otherwise use AI understanding + listing
+        try:
+            route = self.ai.route_query(query)
+        except Exception:
+            route = "list"
+        # Reset RAG context if user explicitly asks for files/folders → switch to listing
+        import re
+        if re.search(r"\b(show|list|open)\b.*\b(folder|directory|under|in)\b", query, re.IGNORECASE):
+            route = "list"
+        # Force RAG summary when the user asks for a summary/what/which without file-browse intent
+        if route != "rag" and re.search(r"\b(summary|summar(ize|ise)|what\b|which\b)", query, re.IGNORECASE):
+            route = "rag"
+        if route == "rag":
+            try:
+                # If index seems empty, show onboarding banner with 1-click init
+                try:
+                    from luma_mod.rag.query import search as rag_search
+                    probe = rag_search("__probe__", k=1)
+                except Exception:
+                    probe = []
+                if not probe:
+                    banner = (
+                        "<div style='background:#eef2ff; color:#3730a3; padding:12px; border-radius:12px; border-left:4px solid #6366f1; margin:8px 20% 12px 0;'>"
+                        "Build your private index to answer from your files. "
+                        "<a href='luma://rag?action=init'>Index now</a>"
+                        "</div>"
+                    )
+                    self.chat_view.append(banner)
+                res = self.ai.crossdoc_answer(query, n_ctx=12)
+                ans = (res.get("answer") or "").replace("\n","<br>")
+                hits = res.get("hits", [])
+                low = bool(res.get("low_confidence", False))
+                # Stop spinner and clear the thinking line
+                self.chat_spinner.stop()
+                self._clear_thinking_line()
+                # Show answer with citations
+                self._add_ai_message(ans)
+                for i, (score, meta) in enumerate(hits, start=1):
+                    path = str(meta.get("path", ""))
+                    page = meta.get("page")
+                    tag = f"{path}:p{page}" if page else path
+                    snippet = str(meta.get("text", ""))[:320].replace("\n", " ")
+                    card_html = (
+                        f"<div style='border:1px solid #e5e7eb; border-radius:10px; padding:10px; margin:8px 20% 8px 0;'>"
+                        f"<div style='font-weight:600; margin-bottom:6px;'>[{i}] {tag}</div>"
+                        f"<div style='color:#374151; font-size:0.95em;'>{snippet}</div>"
+                        f"</div>"
+                    )
+                    self.chat_view.append(card_html)
+                if low:
+                    self.chat_view.append(
+                        "<div style='background:#fef3c7; color:#92400e; padding:10px; border-radius:10px; border-left:4px solid #f59e0b; margin:8px 20% 0 0;'>Not enough info in your files</div>"
+                    )
+                return
+            except Exception:
+                # Fall through to AI understanding flow on failure
+                pass
+
+        # Process via AI understanding (listing path)
         if self._ai_worker and self._ai_worker.isRunning():
             try:
                 self._ai_worker.requestInterruption()
@@ -815,14 +1089,41 @@ class SpotlightUI(QWidget):
                 self._ai_worker.wait(50)
             except Exception:
                 pass
-                
         self._ai_worker = AIWorker(self.ai, query, True)
         self._ai_worker.info_ready.connect(self._handle_ai_response)
         self._ai_worker.start()
+
+    def _clear_thinking_line(self):
+        try:
+            cursor = self.chat_view.textCursor()
+            cursor.movePosition(cursor.MoveOperation.End)
+            cursor.select(cursor.SelectionType.BlockUnderCursor)
+            if "AI is thinking…" in cursor.selectedText():
+                cursor.removeSelectedText()
+                cursor.deletePreviousChar()
+        except Exception:
+            pass
+        # Always hide overlay when clearing thinking line
+        self._hide_loading()
+
+    def _show_loading(self, text: str):
+        try:
+            if hasattr(self, 'chat_overlay') and self.chat_overlay:
+                self.chat_overlay.show_overlay(text)
+        except Exception:
+            pass
+
+    def _hide_loading(self):
+        try:
+            if hasattr(self, 'chat_overlay') and self.chat_overlay:
+                self.chat_overlay.hide_overlay()
+        except Exception:
+            pass
         
     def _add_user_message(self, message: str):
         """Add user message to conversation."""
         from datetime import datetime
+        self._turn_idx += 1
         
         # Convert file/folder paths to clickable links
         clickable_message = make_paths_clickable(message)
@@ -832,6 +1133,7 @@ class SpotlightUI(QWidget):
         <div style='margin-bottom: 16px; display: flex; justify-content: flex-end;'>
             <div style='background: #3b82f6; color: white; border-radius: 12px; padding: 12px 16px; max-width: 80%; box-shadow: 0 1px 3px rgba(0,0,0,0.1);'>
                 <div style='display: flex; align-items: center; margin-bottom: 4px;'>
+                    <span style='background:#1d4ed8; color:#fff; border-radius:8px; font-size:11px; padding:2px 6px; margin-right:8px;'>#{self._turn_idx}</span>
                     <span style='font-weight: 600;'>You</span>
                     <span style='color: rgba(255,255,255,0.7); font-size: 12px; margin-left: 8px;'>{timestamp}</span>
                 </div>
@@ -856,6 +1158,7 @@ class SpotlightUI(QWidget):
             <div style='background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 12px 16px; max-width: 80%; box-shadow: 0 1px 3px rgba(0,0,0,0.1);'>
                 <div style='display: flex; align-items: center; margin-bottom: 8px;'>
                     <div style='width: 8px; height: 8px; background: #3b82f6; border-radius: 50%; margin-right: 8px;'></div>
+                    <span style='background:#e0e7ff; color:#1e293b; border-radius:8px; font-size:11px; padding:2px 6px; margin-right:8px;'>#{self._turn_idx}</span>
                     <span style='font-weight: 600; color: #1e293b;'>AI</span>
                     <span style='color: #64748b; font-size: 12px; margin-left: 8px;'>{timestamp}</span>
                 </div>
@@ -891,6 +1194,7 @@ class SpotlightUI(QWidget):
     def _handle_ai_response(self, info: dict):
         """Handle AI response and show results in conversation."""
         self.chat_spinner.stop()
+        self._hide_loading()
         
         # Remove the "AI is thinking..." message
         cursor = self.chat_view.textCursor()
@@ -912,6 +1216,12 @@ class SpotlightUI(QWidget):
         # Mark that a search has been performed
         self._has_searched = True
         
+        # Apply condition-based rerank for both AI and No-AI flows
+        try:
+            hits = self._conditioned_rerank(hits)
+        except Exception:
+            pass
+
         if hits:
             # Hide no results widget if it exists
             if hasattr(self, 'no_results_widget'):
@@ -1172,7 +1482,7 @@ class SpotlightUI(QWidget):
         # Skip LLM rerank when there are no keywords (pure date queries)
         # Only rerank when there are semantic keywords to work with
         if not query.strip() or not any(word.strip() for word in query.split() if len(word.strip()) > 2):
-            self._apply_hits(hits)
+            self._apply_hits(self._conditioned_rerank(hits))
             return
             
         # Launch AI reranking in background; UI stays responsive
@@ -1182,10 +1492,74 @@ class SpotlightUI(QWidget):
             file_types = getattr(self, '_last_file_types', None)
             folders = getattr(self, '_last_folders', None)
             self._rerank = RerankWorker(self.ai, query, hits, time_window, file_types, folders)
-            self._rerank.reranked.connect(self._apply_hits)
+            self._rerank.reranked.connect(lambda hh: self._apply_hits(self._conditioned_rerank(hh)))
             self._rerank.start()
         except Exception:
-            self._apply_hits(hits)
+            self._apply_hits(self._conditioned_rerank(hits))
+
+    def _conditioned_rerank(self, hits: List[FileHit]) -> List[FileHit]:
+        try:
+            kws = getattr(self, '_last_keywords', []) or []
+            exts = set((getattr(self, '_last_file_types', []) or []))
+            folders = set((getattr(self, '_last_folders', []) or []))
+            tspan = getattr(self, '_last_time_range', None)
+
+            def meets_all(h: FileHit) -> bool:
+                if exts and os.path.splitext(h.path)[1].lower() not in exts:
+                    return False
+                if folders:
+                    depth = getattr(self, '_last_folder_depth', 'any')
+                    if depth == 'exact':
+                        if not any(os.path.dirname(h.path) == f for f in folders):
+                            return False
+                    else:
+                        if not any(h.path.startswith(f + os.sep) or h.path == f for f in folders):
+                            return False
+                base = os.path.basename(h.path).lower(); parent = os.path.basename(os.path.dirname(h.path)).lower()
+                if kws and not any(k.lower() in base or k.lower() in parent for k in kws):
+                    return False
+                if tspan and isinstance(tspan, tuple) and all(tspan):
+                    s, e = tspan
+                    if not (s <= h.mtime <= e):
+                        return False
+                return True
+
+            def meets_partial(h: FileHit) -> int:
+                score = 0
+                base = os.path.basename(h.path).lower(); parent = os.path.basename(os.path.dirname(h.path)).lower()
+                if exts and os.path.splitext(h.path)[1].lower() in exts: score += 1
+                if folders:
+                    depth = getattr(self, '_last_folder_depth', 'any')
+                    if depth == 'exact':
+                        if any(os.path.dirname(h.path) == f for f in folders): score += 1
+                    else:
+                        if any(h.path.startswith(f + os.sep) or h.path == f for f in folders): score += 1
+                if kws and any(k.lower() in base or k.lower() in parent for k in kws): score += 1
+                if tspan and isinstance(tspan, tuple) and all(tspan):
+                    s, e = tspan
+                    if s <= h.mtime <= e: score += 1
+                return score
+
+            full = []; partial = []; rest = []
+            for h in hits:
+                if meets_all(h): full.append(h)
+                else:
+                    p = meets_partial(h)
+                    if p > 0: partial.append((p, h))
+                    else: rest.append(h)
+
+            partial_sorted = [h for _p, h in sorted(partial, key=lambda x: x[0], reverse=True)]
+            ordered = full + partial_sorted + rest
+            # If any conditions were specified, hide items that match zero conditions
+            if (exts or folders or kws or tspan):
+                if not (full or partial):
+                    return []
+                return full + partial_sorted
+            if (exts or folders or kws or tspan) and not (full or partial):
+                return []
+            return ordered
+        except Exception:
+            return hits
 
     def _selected_hit(self)->Optional[FileHit]:
         idx=self.list.currentIndex(); return self.model.item(idx.row()) if idx.isValid() else None
@@ -1323,6 +1697,7 @@ class SpotlightUI(QWidget):
         """Display the summary in the chat area."""
         # Stop the chat spinner
         self.chat_spinner.stop()
+        self._hide_loading()
         
         # Determine which preview pane to use for button state
         if self.stack.currentIndex() == 1:  # Conversation mode
@@ -1437,6 +1812,16 @@ class SpotlightUI(QWidget):
                 else:
                     # Show preview
                     self._show_preview_for(path)
+            elif url.host() == "rag":
+                # luma://rag?action=init
+                action_param = (parse_qs(url.query()).get("action", [""])[0]).lower()
+                if action_param == "init":
+                    try:
+                        from luma_mod.rag.service import ensure_index_started
+                        ensure_index_started(self._folders, exclude=["node_modules", "__pycache__", ".git"])
+                        self._add_ai_message("Indexing started. You can keep asking questions; results will improve as indexing progresses.")
+                    except Exception:
+                        self._add_ai_message("Failed to start indexing. Please try again.")
     
     def _show_preview_for(self, path: str):
         """Show preview for the given file path."""
@@ -1465,21 +1850,19 @@ class SpotlightUI(QWidget):
             return
         self.chat_input.clear()
         
-        # Add user message to conversation
-        self._add_user_message(q)
-        
-        # Show loading indicator
-        self.chat_spinner.start()
-        self.chat_view.append("AI is thinking…\n")
-        
         # Handle the query based on context
         if hasattr(self, "_current_chat_file") and self._current_chat_file:
             # File-specific Q&A
+            # Add user bubble/spinner only for file-specific path
+            self._add_user_message(q)
+            self.chat_spinner.start()
+            self.chat_view.append("AI is thinking…\n")
             self._qa_worker = self._QnAWorker(self.ai, self._current_chat_file, q)
             self._qa_worker.answer_ready.connect(self._apply_answer)
             self._qa_worker.start()
         else:
             # General AI query
+            # Avoid duplicate bubbles: _handle_ai_query will add them
             self._handle_ai_query(q)
 
     def _apply_answer(self, a: str):
@@ -1511,6 +1894,17 @@ class SpotlightUI(QWidget):
         self.preview.update_summarize_button_visibility(self.ai_mode)
         if hasattr(self, 'conversation_preview'):
             self.conversation_preview.update_summarize_button_visibility(self.ai_mode)
+        # Hide folder selection controls on No AI page
+        if hasattr(self, 'folder_btn'):
+            self.folder_btn.setVisible(False)
+        if hasattr(self, 'folder_chip'):
+            self.folder_chip.setVisible(False)
+        if hasattr(self, 'chat_folder_btn'):
+            self.chat_folder_btn.setVisible(False)
+        if hasattr(self, 'chat_folder_chip'):
+            self.chat_folder_chip.setVisible(False)
+        if hasattr(self, 'folder_dropdown'):
+            self.folder_dropdown.setVisible(False)
         # Resize back to search mode
         self.resize(700, 160)
         self.setMinimumSize(700, 160)
@@ -1619,6 +2013,8 @@ class SpotlightUI(QWidget):
             min-width: 140px;
             line-height: 1.2;
         }
+
+        QLabel#folderChip {background: rgba(59,130,246,0.08); border: 1px solid rgba(59,130,246,0.25); border-radius: 10px; padding: 4px 8px; color: #1e40af; font-size: 12px; margin-left: 6px; min-height: 24px;}
         
         QWidget#chatSpinnerHolder {
             background: transparent;
@@ -1732,7 +2128,11 @@ class SpotlightUI(QWidget):
             tm = get_translation_manager()
             if tm.set_language(lang_code):
                 self._update_ui_texts()
-    
+
+    def _open_rag_folder_dialog(self):
+        """Multi-folder chooser for RAG indexing with clear guidance."""
+        pass
+
     def _update_ui_texts(self):
         """Update all UI texts with current translations."""
         # Store current language selection to preserve it
@@ -1758,6 +2158,12 @@ class SpotlightUI(QWidget):
                 self.ai_mode_button.setText(tr("private_mode"))
             elif self.ai_mode == "cloud":
                 self.ai_mode_button.setText(tr("cloud_mode"))
+        # Populate quick folder list with defaults + chosen
+        if hasattr(self, 'folder_list'):
+            self.folder_list.clear()
+            known = list(dict.fromkeys([*self._rag_folders, *DEFAULT_FOLDERS]))
+            for p in known:
+                self.folder_list.addItem(p)
         
         # Update dropdown options
         if hasattr(self, 'no_ai_btn'):
@@ -1771,6 +2177,7 @@ class SpotlightUI(QWidget):
         if hasattr(self, 'lbl_chat_title'):
             self.lbl_chat_title.setText(tr("ask_follow_up"))
         if hasattr(self, 'chat_input'):
+            # Force friendly placeholder regardless of previous state
             self.chat_input.setPlaceholderText(tr("ask_follow_up"))
         if hasattr(self, 'chat_send'):
             self.chat_send.setText(tr("send"))

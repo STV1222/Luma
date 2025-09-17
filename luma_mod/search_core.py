@@ -144,6 +144,16 @@ def search_files(folders: List[str], keywords: List[str], allow_exts: List[str],
                 else:
                     # Use traditional scoring
                     base_score = filename_score(fn, keywords)
+                # Extra tightening: if keywords include a multi-word phrase, boost exact phrase matches a lot
+                try:
+                    phrase_keys = [k for k in keywords if ' ' in k]
+                    if phrase_keys:
+                        lowered = fn.lower()
+                        for ph in phrase_keys:
+                            if ph.lower() in lowered:
+                                base_score += 120
+                except Exception:
+                    pass
                 
                 if base_score <= 0:
                     continue

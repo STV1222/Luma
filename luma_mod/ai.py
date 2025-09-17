@@ -7,6 +7,8 @@ from urllib.error import URLError
 from .dates import extract_time_window
 from .utils import FILETYPE_MAP, find_dirs_by_hint, find_dirs_by_tokens, find_exact_folder_match, DEFAULT_FOLDERS
 from .content import extract_text_from_file
+from .rag.service import ensure_index_started
+from .rag.query import search as rag_search, build_prompt as rag_build_prompt
 
 try:
     from langchain_community.llms import Ollama
@@ -89,6 +91,7 @@ class LumaAI:
         self._openai_client = None
         self.mode = mode  # "private" for local AI, "cloud" for OpenAI
         self.openai_api_key = openai_api_key
+        # RAG indexing is initialized on-demand to avoid heavy startup and OpenMP conflicts.
 
     def _ensure(self) -> bool:
         if self.mode == "cloud":
@@ -159,6 +162,56 @@ class LumaAI:
         print("DEBUG: No AI model available")
         return ""
 
+    # -------------- Intent routing: listing/opening vs cross-document Q&A --------------
+    def route_query(self, query: str) -> str:
+        """Decide whether to use local listing or RAG cross-document answering.
+
+        Returns one of: "list", "rag". Default is "list" to preserve existing behavior.
+        """
+        import re
+        listing_pattern = re.compile(r"\b(list|show|all)\b.*\b(folder|directory|under|in)\b", re.IGNORECASE)
+        crossdoc_pattern = re.compile(r"\b(summar(ize|ise)|compare|what\s+does|mentions?|across|find\s+every|policy|contract|requirements?)\b", re.IGNORECASE)
+        if crossdoc_pattern.search(query):
+            return "rag"
+        if listing_pattern.search(query):
+            return "list"
+        # Heuristic: questions starting with what/how/why likely cross-doc
+        if re.match(r"\b(what|how|why|which|who|where)\b", query.strip(), re.IGNORECASE):
+            return "rag"
+        return "list"
+
+    def crossdoc_answer(self, query: str, n_ctx: int = 12) -> dict:
+        """Answer using local RAG index with citations. Uses local LLM in private mode, OpenAI in cloud mode.
+        Applies lightweight folder/path prefilters derived from the query.
+        """
+        prefilter_paths: list[str] = []
+        try:
+            # Use cheap regex-based parser to extract folder hints and resolve to paths
+            info_nonai = self.parse_query_nonai(query)
+            folders: list[str] = info_nonai.get("folders", []) if isinstance(info_nonai, dict) else []
+            if folders:
+                prefilter_paths = folders
+        except Exception:
+            prefilter_paths = []
+        try:
+            hits = rag_search(query, k=max(20, n_ctx * 2), prefilter_paths=prefilter_paths or None)
+        except Exception:
+            hits = []
+        low_conf = True
+        if hits:
+            try:
+                max_score = max(s for s, _ in hits)
+                low_conf = (max_score < 0.2) or (len(hits) < 3)
+            except Exception:
+                low_conf = True
+        if not hits:
+            return {"answer": "Not enough info from the provided files.", "hits": [], "low_confidence": True}
+
+        system_msg, user_msg = rag_build_prompt(query, hits, n_ctx=n_ctx)
+        prompt = f"{system_msg}\n\n{user_msg}\n\nAnswer:"
+        answer = (self._invoke_ai(prompt) or "").strip()
+        return {"answer": answer, "hits": hits[:n_ctx], "low_confidence": low_conf}
+
     def parse_query_nonai(self, query: str) -> Dict[str, Any]:
         tr = extract_time_window(query)
         kws = strip_time_keywords(extract_keywords(query), query, tr)
@@ -176,17 +229,28 @@ class LumaAI:
         if m:
             folder_hint = m.group(1).strip()
         folders = None
+        folder_depth = "any"
         # If user says/implies folder, prioritize exact folder resolution first
         if folder_hint:
-            # Try exact matching first, then fall back to fuzzy matching
             folders = find_exact_folder_match(folder_hint)
             if not folders:
                 folders = find_dirs_by_tokens(DEFAULT_FOLDERS, [folder_hint]) or find_dirs_by_hint(DEFAULT_FOLDERS, folder_hint)
         else:
-            # If no explicit hint but “folder” word present anywhere, extract best token
             if re.search(r"\bfolder\b", query, re.IGNORECASE):
                 folders = find_dirs_by_tokens(DEFAULT_FOLDERS, kws)
-        return {"keywords": kws, "time_range": None if tr==(None,None) else tr, "file_types": [], "time_attr": "mtime", "folders": folders or []}
+        # Depth heuristics for phrases like "on Desktop" or "this folder"
+        try:
+            if re.search(r"\bon\s+(?:my\s+)?desktop\b", query, re.IGNORECASE) or re.search(r"\b(this|same)\s+folder\b", query, re.IGNORECASE):
+                folder_depth = "exact"
+                if re.search(r"\bdesktop\b", query, re.IGNORECASE):
+                    import os
+                    desk = os.path.expanduser("~/Desktop")
+                    folders = (folders or [])
+                    if desk not in folders:
+                        folders.append(desk)
+        except Exception:
+            pass
+        return {"keywords": kws, "time_range": None if tr==(None,None) else tr, "file_types": [], "time_attr": "mtime", "folders": folders or [], "folder_depth": folder_depth}
 
     def parse_query_ai(self, query: str) -> Dict[str, Any]:
         if not self._ensure() or not query.strip():
@@ -327,6 +391,10 @@ class LumaAI:
             if not _query_mentions_explicit_types(query) and not allow:
                 allow = []
             
+            # Explicit file type tightening: if user mentions ppt/powerpoint, restrict strictly to ppt/pptx
+            import re as _re
+            if _re.search(r"\b(pptx?|power\s*point|powerpoint)\b", query, _re.IGNORECASE):
+                allow = ['.ppt', '.pptx']
             # Use AI folder hints first, then fall back to regex
             ai_folders = data.get("folders", [])
             ai_folder_hints = data.get("folder_hints", [])
@@ -346,6 +414,12 @@ class LumaAI:
                         # Fall back to fuzzy matching only if no exact matches found
                         fuzzy_matches = find_dirs_by_tokens(DEFAULT_FOLDERS, [folder_name]) or find_dirs_by_hint(DEFAULT_FOLDERS, folder_name)
                         folders.extend(fuzzy_matches)
+                # Limit breadth: if we found exact matches, prefer only those; cap to 3 folders
+                if folders:
+                    # Deduplicate while preserving order
+                    seen=set(); folders=[f for f in folders if not (f in seen or seen.add(f))]
+                    if len(folders) > 3:
+                        folders = folders[:3]
             else:
                 # Fall back to regex pattern matching
                 import re
@@ -372,7 +446,8 @@ class LumaAI:
                      "content_hints": data.get("content_hints", []),
                      "confidence": data.get("confidence", 0),
                      "reasoning": data.get("reasoning", "unknown"),
-                     "language": data.get("language", "unknown")}
+                     "language": data.get("language", "unknown"),
+                     "folder_depth": "exact" if re.search(r"\bon\s+(?:my\s+)?desktop\b", query, re.IGNORECASE) or re.search(r"\b(this|same)\s+folder\b", query, re.IGNORECASE) else "any"}
             
             # Debug output for AI query understanding
             print(f"🧠 AI-First Understanding:")
@@ -386,6 +461,7 @@ class LumaAI:
             print(f"   Confidence: {data.get('confidence', 0)}%")
             print(f"   Reasoning: {data.get('reasoning', 'unknown')}")
             print(f"   Language: {data.get('language', 'unknown')}")
+            print(f"   Folder Depth: {data.get('folder_depth', 'any')}")
             print(f"   Combined Keywords: {kws}")
             print(f"   Time Range: {tr}")
             print(f"   File Types: {allow}")

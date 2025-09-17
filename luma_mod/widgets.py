@@ -173,6 +173,38 @@ class BusySpinner(QWidget):
         p.setPen(hi); p.drawArc(rect, int(-16*self._angle), 16*110)
 
 
+class LoadingOverlay(QWidget):
+    """Fullscreen dim overlay with centered spinner and message."""
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setVisible(False)
+        self.setObjectName("loadingOverlay")
+        self.setStyleSheet("""
+        QWidget#loadingOverlay { background: rgba(0,0,0,0.45); }
+        QLabel#loadingText { color: #e5e7eb; font-size: 16px; font-weight: 600; }
+        QWidget#loadingPanel { background: rgba(31,41,55,0.8); border-radius: 12px; padding: 12px 16px; }
+        """)
+        root = QVBoxLayout(self); root.setContentsMargins(0,0,0,0)
+        root.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        panel = QWidget(); panel.setObjectName("loadingPanel")
+        lay = QHBoxLayout(panel); lay.setContentsMargins(16,12,16,12); lay.setSpacing(10)
+        self._spinner = BusySpinner(18)
+        self._spinner.start()
+        self._text = QLabel("Loading…"); self._text.setObjectName("loadingText")
+        lay.addWidget(self._spinner)
+        lay.addWidget(self._text)
+        root.addWidget(panel, alignment=Qt.AlignmentFlag.AlignCenter)
+
+    def show_overlay(self, text: str = "Loading…") -> None:
+        self._text.setText(text)
+        if self.parent():
+            self.resize(self.parent().size())
+        self.setVisible(True)
+
+    def hide_overlay(self) -> None:
+        self.setVisible(False)
+
 class ToggleSwitch(QCheckBox):
     def __init__(self, text="Ask AI", parent=None):
         super().__init__(text, parent)
@@ -269,9 +301,9 @@ class PreviewPane(QWidget):
         self._orig_thumb: Optional[QPixmap] = None
         self._orig_orientation: Optional[str] = None
         # Summary section
-        sumHeader = QLabel(tr("summary")); sumHeader.setObjectName("metaHeader")
+        self.sum_header = QLabel(tr("summary")); self.sum_header.setObjectName("metaHeader")
         sumRow = QHBoxLayout(); sumRow.setContentsMargins(0,0,0,0)
-        sumRow.addWidget(sumHeader); sumRow.addStretch(1)
+        sumRow.addWidget(self.sum_header); sumRow.addStretch(1)
         sumRow.addWidget(self.btn_summarize)
         root.addLayout(sumRow, 0)
         self.summary = QTextEdit(); self.summary.setReadOnly(True); self.summary.setVisible(False)
@@ -312,9 +344,14 @@ class PreviewPane(QWidget):
         # Show loading message
         self.thumb.setText(tr("loading_preview"))
         
-        # Show summarize button only for text-like and supported doc types AND when AI mode is enabled
-        if ((ext in TEXT_EXTS) or (ext in {".pdf",".docx",".pptx"})) and ai_mode != "none":
-            self.btn_summarize.setVisible(True)
+        # Show summarize header/button only for text-like types AND when AI mode is enabled
+        can_summarize = ((ext in TEXT_EXTS) or (ext in {".pdf",".docx",".pptx"})) and ai_mode != "none"
+        self.btn_summarize.setVisible(can_summarize)
+        # Hide the "Summary" label in No AI mode to avoid an empty section
+        try:
+            self.sum_header.setVisible(ai_mode != "none")
+        except Exception:
+            pass
     
     def _on_preview_ready(self, path: str, pixmap: QPixmap, orientation: str):
         """Handle successful preview generation."""
@@ -329,12 +366,20 @@ class PreviewPane(QWidget):
         """Update the summarize button visibility based on AI mode."""
         if ai_mode == "none":
             self.btn_summarize.setVisible(False)
+            try:
+                self.sum_header.setVisible(False)
+            except Exception:
+                pass
         else:
             # Only show if we have a file and it's a supported type
             if hasattr(self, '_current_file') and self._current_file:
                 ext = os.path.splitext(self._current_file)[1].lower()
                 if (ext in TEXT_EXTS) or (ext in {".pdf",".docx",".pptx"}):
                     self.btn_summarize.setVisible(True)
+                    try:
+                        self.sum_header.setVisible(True)
+                    except Exception:
+                        pass
 
     def resizeEvent(self, ev):
         super().resizeEvent(ev); self._fit_thumb()
