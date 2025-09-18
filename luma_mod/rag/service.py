@@ -51,16 +51,13 @@ def _call_model(system_msg: str, user_msg: str) -> str:
     try:
         from openai import OpenAI  # type: ignore
         client = OpenAI()
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg},
-            ],
-            temperature=0.2,
-            max_tokens=250,
+        prompt = f"{system_msg}\n\n{user_msg}"
+        resp = client.responses.create(
+            model="gpt-5-nano",
+            input=prompt,
+            text={"verbosity": "low"}
         )
-        return (resp.choices[0].message.content or "").strip()
+        return (getattr(resp, "output_text", None) or "").strip()
     except Exception:
         # If offline/unavailable
         return "Not enough info from the provided files."

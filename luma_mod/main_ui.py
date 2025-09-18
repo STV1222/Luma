@@ -749,6 +749,7 @@ class SpotlightUI(QWidget):
         kws, tr, tattr = info.get("keywords", []), info.get("time_range"), info.get("time_attr","mtime")
         # Optional folder narrowing from parsing stage — if folders present, use them and drop folder words from keywords
         folders = info.get("folders") or []
+        # If the query supplied a folder scope, hard-scope to it; otherwise use defaults
         target_folders = folders if folders else self._folders
         if folders and kws:
             # Remove folder-like tokens to avoid filtering away files by ext match
@@ -817,10 +818,23 @@ class SpotlightUI(QWidget):
                 try:
                     self.chat_view.clear()
                     self.chat_view.append("<div style='margin:6px 0 12px 0; color:#6b7280;'>Asking across your documents…</div>")
+                    # Show loading indicator (overlay + small spinner) while RAG runs
+                    try:
+                        self.chat_spinner.start()
+                        self._show_loading("AI is thinking…")
+                        self.chat_view.append("AI is thinking…\n")
+                    except Exception:
+                        pass
                     res = self.ai.crossdoc_answer(q, n_ctx=12)
                     ans = (res.get("answer") or "").replace("\n","<br>")
                     hits = res.get("hits", [])
                     low = bool(res.get("low_confidence", False))
+                    # Stop spinner and clear the thinking line
+                    try:
+                        self.chat_spinner.stop()
+                        self._clear_thinking_line()
+                    except Exception:
+                        pass
                     self._add_ai_message(ans)
                     for i, (score, meta) in enumerate(hits, start=1):
                         path = str(meta.get("path", ""))
@@ -865,6 +879,11 @@ class SpotlightUI(QWidget):
                     return
                 except Exception:
                     # If RAG fails, fallback to AI listing flow
+                    try:
+                        self.chat_spinner.stop()
+                        self._clear_thinking_line()
+                    except Exception:
+                        pass
                     pass
             self._handle_ai_query(q)
 
@@ -1019,41 +1038,47 @@ class SpotlightUI(QWidget):
             pass
         
     def _add_user_message(self, message: str):
-        """Add user message to conversation."""
+        """Add a grouped Q/A card container with the user's message and an AI placeholder."""
         from datetime import datetime
         self._turn_idx += 1
-        
+
         # Convert file/folder paths to clickable links
         clickable_message = make_paths_clickable(message)
         timestamp = datetime.now().strftime("%H:%M")
-        
-        user_bubble_html = f"""
-        <div style='margin-bottom: 16px; display: flex; justify-content: flex-end;'>
-            <div style='background: #3b82f6; color: white; border-radius: 12px; padding: 12px 16px; max-width: 80%; box-shadow: 0 1px 3px rgba(0,0,0,0.1);'>
-                <div style='display: flex; align-items: center; margin-bottom: 4px;'>
-                    <span style='background:#1d4ed8; color:#fff; border-radius:8px; font-size:11px; padding:2px 6px; margin-right:8px;'>#{self._turn_idx}</span>
-                    <span style='font-weight: 600;'>You</span>
-                    <span style='color: rgba(255,255,255,0.7); font-size: 12px; margin-left: 8px;'>{timestamp}</span>
+
+        # Unique placeholder token for this turn. We'll replace it when AI responds.
+        placeholder = f"<!--AI_SLOT_{self._turn_idx}-->"
+
+        # Q/A card wrapper with rounded corners and subtle border
+        qa_card_html = f"""
+        <div id='qa-{self._turn_idx}' style='background:#ffffff; border:1px solid #e5e7eb; border-radius:16px; padding:14px 16px; margin:12px 0; box-shadow: 0 1px 4px rgba(0,0,0,0.05);'>
+            <div style='margin-bottom: 10px; display: flex; justify-content: flex-end;'>
+                <div style='background: #3b82f6; color: white; border-radius: 12px; padding: 10px 14px; max-width: 88%; box-shadow: 0 1px 3px rgba(0,0,0,0.1);'>
+                    <div style='display: flex; align-items: center; margin-bottom: 4px;'>
+                        <span style='background:#1d4ed8; color:#fff; border-radius:8px; font-size:11px; padding:2px 6px; margin-right:8px;'>#{self._turn_idx}</span>
+                        <span style='font-weight: 600;'>You</span>
+                        <span style='color: rgba(255,255,255,0.85); font-size: 12px; margin-left: 8px;'>{timestamp}</span>
+                    </div>
+                    <div style='color: #ffffff;'>{clickable_message}</div>
                 </div>
-                <div style='color: white;'>{clickable_message}</div>
             </div>
+            {placeholder}
         </div>
         """
-        
-        self.chat_view.append(user_bubble_html)
+
+        self.chat_view.append(qa_card_html)
         
         
     def _add_ai_message(self, message: str):
-        """Add AI message to conversation."""
+        """Insert AI message into the current Q/A card if possible; otherwise append as a standalone bubble."""
         from datetime import datetime
-        
-        # Convert file/folder paths to clickable links
+
         clickable_message = make_paths_clickable(message)
         timestamp = datetime.now().strftime("%H:%M")
-        
+
         ai_bubble_html = f"""
-        <div style='margin-bottom: 16px; display: flex; justify-content: flex-start;'>
-            <div style='background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 12px 16px; max-width: 80%; box-shadow: 0 1px 3px rgba(0,0,0,0.1);'>
+        <div style='display: flex; justify-content: flex-start;'>
+            <div style='background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 12px 16px; max-width: 88%; box-shadow: 0 1px 3px rgba(0,0,0,0.06);'>
                 <div style='display: flex; align-items: center; margin-bottom: 8px;'>
                     <div style='width: 8px; height: 8px; background: #3b82f6; border-radius: 50%; margin-right: 8px;'></div>
                     <span style='background:#e0e7ff; color:#1e293b; border-radius:8px; font-size:11px; padding:2px 6px; margin-right:8px;'>#{self._turn_idx}</span>
@@ -1064,7 +1089,19 @@ class SpotlightUI(QWidget):
             </div>
         </div>
         """
-        
+
+        # Try to place inside the latest Q/A card placeholder
+        placeholder = f"<!--AI_SLOT_{self._turn_idx}-->"
+        try:
+            current_html = self.chat_view.toHtml()
+            if placeholder in current_html:
+                updated = current_html.replace(placeholder, ai_bubble_html)
+                self.chat_view.setHtml(updated)
+                return
+        except Exception:
+            pass
+
+        # Fallback: append as standalone
         self.chat_view.append(ai_bubble_html)
         
     def _show_ai_understanding(self, info: dict):
@@ -1105,8 +1142,25 @@ class SpotlightUI(QWidget):
         # Show AI's understanding to the user
         self._show_ai_understanding(info)
         
-        # Start search with AI info
+        # Start search with AI info; enforce folder scoping and match quality messages
+        try:
+            folder_hint_present = bool(info.get("folder_hint_present"))
+            match_quality = str(info.get("folder_match_quality", "none"))
+            # If user asked for a folder but we haven't got any match, return a clear message
+            if folder_hint_present and (not info.get("folders")):
+                self._add_ai_message("No results: folder hint not found. Please pick the folder via the Folders button or rephrase.")
+                return
+        except Exception:
+            pass
         self._start_search_with_info(info, "User")
+        # After dispatching search, show match quality notice if applicable
+        try:
+            if match_quality == "exact":
+                self._add_ai_message("Folder scope: fully match.")
+            elif match_quality == "close":
+                self._add_ai_message("Folder scope: close match (best-guess).")
+        except Exception:
+            pass
         
     def _apply_hits(self, hits: List[FileHit]):
         self.spinner.stop()

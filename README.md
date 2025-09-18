@@ -28,7 +28,7 @@ Optional (recommended):
 - sentence-transformers + faiss-cpu (for local RAG)
 - pypdf, python-docx, python-pptx, chardet (text extraction for RAG)
 - langchain-community + ollama (for Private Mode AI)
-- openai (for Cloud Mode AI)
+- openai (for Cloud Mode AI, version >= 1.107.0)
 
 Install core UI:
 ```bash
@@ -79,6 +79,21 @@ You can change these defaults in `luma_mod/utils.py` (`DEFAULT_FOLDERS`).
 - `LUMA_AI_MODE`: default AI mode at startup. Values: `none` | `private` | `cloud` (default: `none`).
 - `OPENAI_API_KEY`: required for Cloud Mode (OpenAI).
 
+Cloud Mode details (OpenAI):
+- The app uses the OpenAI Responses API with model `gpt-5-nano` by default for fast, low‑latency answers.
+- Internally we call `client.responses.create(model="gpt-5-nano", input=...)` and read `response.output_text`.
+- You can tune verbosity/reasoning by editing the code to pass `text={"verbosity":"low|medium|high"}` or `reasoning={"effort":"minimal|low|medium|high"}`. Defaults are optimized for speed.
+ - SDK requirement: `openai>=1.107.0`. Upgrade and verify:
+   ```bash
+   pip install -U openai
+   python - <<'PY'
+   import openai, inspect
+   print('openai version:', getattr(openai,'__version__','unknown'))
+   from openai import OpenAI
+   print('has .responses?', hasattr(OpenAI(), 'responses'))
+   PY
+   ```
+
 Examples:
 ```bash
 export LUMA_AI_MODE=private
@@ -106,6 +121,21 @@ Use the “Ask AI” button in the search bar to switch modes:
   - file summarization
   - cross‑document questions via local RAG with citations
 - Cloud Mode: same features but uses OpenAI
+  - Uses `gpt-5-nano` via the Responses API for chat and RAG answers by default
+
+#### Cloud Mode (GPT‑5) specifics
+- Model: `gpt-5-nano`
+- API: OpenAI Responses API, not Chat Completions
+- Parameters used: `reasoning.effort=minimal`, `text.verbosity=low` (fast, concise)
+- No legacy params: we do not send `temperature` or `max_tokens` to avoid 400s
+- Summarize: uses only `gpt-5-nano` (no extractive fallback). If the API returns no text or errors after light retries, the UI shows that the summary is unavailable
+
+#### Folder scoping and match quality
+- When your query mentions a folder (e.g., “in/under ‘Business’ folder”), Luma resolves folder scope before searching
+  - Exact match → search is strictly scoped to that folder; UI notes “Folder scope: fully match.”
+  - Close/fuzzy match (best guess under defaults) → scope to the best candidates; UI notes “Folder scope: close match.”
+  - If a folder hint is present but nothing matches → we do not broaden the search. The UI explains: “No results: folder hint not found.”
+  - If no folder is mentioned → defaults to user directories (`~/Desktop`, `~/Documents`, `~/Downloads`, `~/Pictures`)
 
 Notes:
 - Private/Cloud modes switch the UI to a chat‑style page for richer interactions.
@@ -274,6 +304,12 @@ python -m pytest -q tests/test_rag.py
   - Install `openai` and set your API key (the app may also provide a UI field):
     - `export OPENAI_API_KEY=sk-...` (macOS/Linux)
     - `setx OPENAI_API_KEY "sk-..."` (Windows PowerShell)
+  - If you see an error like `Unsupported parameter: 'max_tokens'`, update your code/config; Cloud Mode now uses the Responses API (use `responses.create(..., text={...})` rather than Chat Completions with `max_tokens`).
+  - If you see `'OpenAI' object has no attribute 'responses'`, your SDK is outdated or shadowed:
+    - `pip install -U openai`
+    - Ensure you’re not shadowing the package with a local `openai.py` or `openai/` directory
+    - Clear caches: `find . -name "__pycache__" -type d -exec rm -rf {} +`
+  - If you see `Unsupported parameter: 'temperature'`, you’re likely sending legacy params; the app omits `temperature` for `gpt-5-nano` per Responses API guidance
 - Missing previews for Office files on macOS
   - Quick Look is used; if it fails, a generic icon is shown
 

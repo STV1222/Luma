@@ -92,6 +92,11 @@ class LumaAI:
         self.mode = mode  # "private" for local AI, "cloud" for OpenAI
         self.openai_api_key = openai_api_key
         # RAG indexing is initialized on-demand to avoid heavy startup and OpenMP conflicts.
+        try:
+            import os as _os
+            print("DEBUG: ai.py loaded from", __file__, "pid", _os.getpid())
+        except Exception:
+            pass
 
     def _ensure(self) -> bool:
         if self.mode == "cloud":
@@ -136,20 +141,27 @@ class LumaAI:
     def _invoke_ai(self, prompt: str) -> str:
         """Invoke the appropriate AI model based on current mode."""
         if self.mode == "cloud" and self._ensure_openai():
-            try:
-                print("DEBUG: Calling OpenAI API...")
-                response = self._openai_client.chat.completions.create(
-                    model="gpt-4o-mini",  # Fixed model name
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=1000,
-                    temperature=0.1
-                )
-                result = response.choices[0].message.content.strip()
-                print(f"DEBUG: OpenAI response received: {len(result)} characters")
-                return result
-            except Exception as e:
-                print(f"DEBUG: OpenAI API call failed: {e}")
-                return ""
+            # Light retry on transient network errors; follow GPT-5 Responses API guidance
+            import time as _time
+            last_err = None
+            for attempt in range(3):
+                try:
+                    print("DEBUG: Calling OpenAI API (Responses API, gpt-5-nano)...")
+                    response = self._openai_client.responses.create(
+                        model="gpt-5-nano",
+                        input=prompt,
+                        reasoning={"effort": "minimal"},
+                        text={"verbosity": "low"},
+                    )
+                    result = (getattr(response, "output_text", None) or "").strip()
+                    print(f"DEBUG: OpenAI response received: {len(result)} characters")
+                    return result
+                except Exception as e:
+                    last_err = e
+                    print(f"DEBUG: OpenAI API call failed: {e}")
+                    _time.sleep(0.6)
+            print(f"DEBUG: OpenAI retries exhausted: {last_err}")
+            return ""
         elif self.mode == "private" and self._ensure_ollama():
             try:
                 print("DEBUG: Calling Ollama...")
@@ -250,7 +262,20 @@ class LumaAI:
                         folders.append(desk)
         except Exception:
             pass
-        return {"keywords": kws, "time_range": None if tr==(None,None) else tr, "file_types": [], "time_attr": "mtime", "folders": folders or [], "folder_depth": folder_depth}
+        # Folder match quality + presence
+        folder_hint_present = bool(folder_hint or re.search(r"\bfolder\b", query, re.IGNORECASE))
+        match_quality = "none"
+        if folders:
+            match_quality = "exact" if folder_hint and find_exact_folder_match(folder_hint) else "close"
+        return {"keywords": kws,
+                "time_range": None if tr==(None,None) else tr,
+                "file_types": [],
+                "time_attr": "mtime",
+                "folders": folders or [],
+                "folder_depth": folder_depth,
+                "folder_hint_present": folder_hint_present,
+                "folder_hint_text": folder_hint or "",
+                "folder_match_quality": match_quality}
 
     def parse_query_ai(self, query: str) -> Dict[str, Any]:
         if not self._ensure() or not query.strip():
@@ -403,6 +428,9 @@ class LumaAI:
             # Combine AI folders and folder hints
             all_folder_hints = ai_folders + ai_folder_hints
             
+            match_quality = "none"
+            folder_hint_present = bool(all_folder_hints)
+            folder_hint_text = all_folder_hints[0] if all_folder_hints else ""
             if all_folder_hints:
                 # Use AI-extracted folder names with exact matching first
                 folders = []
@@ -410,10 +438,13 @@ class LumaAI:
                     exact_matches = find_exact_folder_match(folder_name)
                     if exact_matches:
                         folders.extend(exact_matches)
+                        match_quality = "exact"
                     else:
                         # Fall back to fuzzy matching only if no exact matches found
                         fuzzy_matches = find_dirs_by_tokens(DEFAULT_FOLDERS, [folder_name]) or find_dirs_by_hint(DEFAULT_FOLDERS, folder_name)
                         folders.extend(fuzzy_matches)
+                        if fuzzy_matches and match_quality != "exact":
+                            match_quality = "close"
                 # Limit breadth: if we found exact matches, prefer only those; cap to 3 folders
                 if folders:
                     # Deduplicate while preserving order
@@ -433,9 +464,21 @@ class LumaAI:
                     m2 = re.search(r"\b(?:in|under|inside)\s+([A-Za-z0-9_\- ]+)\b", query, re.IGNORECASE)
                 if m2:
                     folder_hint = m2.group(1).strip()
-                    folders = find_dirs_by_tokens(DEFAULT_FOLDERS, [folder_hint]) or find_dirs_by_hint(DEFAULT_FOLDERS, folder_hint)
+                    folder_hint_present = True
+                    folder_hint_text = folder_hint
+                    exact = find_exact_folder_match(folder_hint)
+                    if exact:
+                        folders = exact
+                        match_quality = "exact"
+                    else:
+                        folders = find_dirs_by_tokens(DEFAULT_FOLDERS, [folder_hint]) or find_dirs_by_hint(DEFAULT_FOLDERS, folder_hint)
+                        if folders:
+                            match_quality = "close"
                 elif re.search(r"\bfolder\b", query, re.IGNORECASE):
+                    folder_hint_present = True
                     folders = find_dirs_by_tokens(DEFAULT_FOLDERS, kws)
+                    if folders:
+                        match_quality = "close"
             result = {"keywords": kws, "time_range": None if tr==(None,None) else tr,
                      "file_types": allow, "time_attr": time_attr, "folders": folders, 
                      "user_intent": data.get("user_intent", "unknown"), 
@@ -447,7 +490,10 @@ class LumaAI:
                      "confidence": data.get("confidence", 0),
                      "reasoning": data.get("reasoning", "unknown"),
                      "language": data.get("language", "unknown"),
-                     "folder_depth": "exact" if re.search(r"\bon\s+(?:my\s+)?desktop\b", query, re.IGNORECASE) or re.search(r"\b(this|same)\s+folder\b", query, re.IGNORECASE) else "any"}
+                     "folder_depth": "exact" if re.search(r"\bon\s+(?:my\s+)?desktop\b", query, re.IGNORECASE) or re.search(r"\b(this|same)\s+folder\b", query, re.IGNORECASE) else "any",
+                     "folder_hint_present": folder_hint_present,
+                     "folder_hint_text": folder_hint_text,
+                     "folder_match_quality": match_quality}
             
             # Debug output for AI query understanding
             print(f"🧠 AI-First Understanding:")
@@ -585,7 +631,7 @@ class LumaAI:
                 print(f"DEBUG: Summary generated: {len(out)} characters")
                 return out.strip()
             else:
-                print("DEBUG: Empty response from AI")
+                print("DEBUG: Empty response from AI (gpt-5-nano). No fallback per user preference.")
                 return None
         except Exception as e:
             print(f"DEBUG: Exception in summarize_file: {e}")
