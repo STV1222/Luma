@@ -2,7 +2,7 @@ from __future__ import annotations
 import os
 from typing import Optional, List
 
-from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QUrl
+from PyQt6.QtCore import Qt, QTimer, QUrl
 from PyQt6.QtWidgets import QWidget, QFrame, QLineEdit, QComboBox, QListView, QVBoxLayout, QHBoxLayout, QSplitter, QSizePolicy, QTextEdit, QPushButton, QLabel, QStackedLayout, QTextBrowser, QFileDialog, QDialog, QListWidget, QDialogButtonBox
 from PyQt6.QtGui import QTextCursor, QMouseEvent, QKeyEvent, QGuiApplication
 
@@ -12,130 +12,28 @@ from .models import ResultsModel, ResultDelegate, FileHit
 from .ai import LumaAI
 from .search_core import search_files
 from .i18n import get_translation_manager, tr
+from .ui.chat_browser import ChatBrowser
+from .ui.workers import (
+    SearchWorker,
+    AIWorker,
+    RerankWorker,
+    SummarizeWorker,
+    QnAWorker,
+    WarmupWorker,
+)
+from .config import get_openai_api_key, get_default_ai_mode
 
 
-class ChatBrowser(QTextBrowser):
-    """Custom QTextBrowser that can handle clicks on file/folder links."""
-    
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setOpenLinks(False)
-        self.setOpenExternalLinks(False)
-        self.setReadOnly(True)
-        self.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.LinksAccessibleByMouse)
-        self.anchorClicked.connect(self._on_anchor_clicked)
-        self._current_focused_element = None
-    
-    def _on_anchor_clicked(self, url: QUrl):
-        """Handle single-click on links."""
-        # Find the main UI widget that has the handle_chat_link method
-        widget = self.parent()
-        while widget and not hasattr(widget, 'handle_chat_link'):
-            widget = widget.parent()
-        if widget:
-            widget.handle_chat_link(url, action="preview")
-    
-    def mouseDoubleClickEvent(self, event: QMouseEvent):
-        """Handle double-click on links."""
-        cursor = self.cursorForPosition(event.pos())
-        if cursor.charFormat().isAnchor():
-            href = cursor.charFormat().anchorHref()
-            if href:
-                from PyQt6.QtCore import QUrl
-                # Find the main UI widget that has the handle_chat_link method
-                widget = self.parent()
-                while widget and not hasattr(widget, 'handle_chat_link'):
-                    widget = widget.parent()
-                if widget:
-                    widget.handle_chat_link(QUrl(href), action="open")
-                return
-        super().mouseDoubleClickEvent(event)
-    
-    def keyPressEvent(self, event: QKeyEvent):
-        """Handle keyboard navigation."""
-        if event.key() == Qt.Key.Key_Up or event.key() == Qt.Key.Key_Down:
-            # Navigate through clickable elements
-            self._navigate_results(event.key() == Qt.Key.Key_Down)
-            event.accept()
-        elif event.key() == Qt.Key.Key_Return or event.key() == Qt.Key.Key_Enter:
-            # Open the focused element
-            if self._current_focused_element:
-                from PyQt6.QtCore import QUrl
-                # Find the main UI widget that has the handle_chat_link method
-                widget = self.parent()
-                while widget and not hasattr(widget, 'handle_chat_link'):
-                    widget = widget.parent()
-                if widget:
-                    widget.handle_chat_link(QUrl(self._current_focused_element), action="preview")
-            event.accept()
-        elif event.modifiers() & Qt.KeyboardModifier.ControlModifier and event.key() == Qt.Key.Key_O:
-            # Ctrl+O opens the focused element
-            if self._current_focused_element:
-                from PyQt6.QtCore import QUrl
-                # Find the main UI widget that has the handle_chat_link method
-                widget = self.parent()
-                while widget and not hasattr(widget, 'handle_chat_link'):
-                    widget = widget.parent()
-                if widget:
-                    widget.handle_chat_link(QUrl(self._current_focused_element), action="open")
-            event.accept()
-        else:
-            super().keyPressEvent(event)
-    
-    def _navigate_results(self, down: bool):
-        """Navigate through results using arrow keys."""
-        # This is a simplified implementation
-        # In a full implementation, you'd track all clickable elements and navigate between them
-        pass
+# ChatBrowser moved to luma_mod.ui.chat_browser
 
 
-class SearchWorker(QThread):
-    results_ready = pyqtSignal(list)
-    def __init__(self, folders, keywords, allow_exts, time_range, time_attr="mtime", semantic_keywords=None, file_patterns=None):
-        super().__init__(); 
-        self.folders=folders; self.keywords=keywords; self.allow_exts=allow_exts; 
-        self.time_range=time_range; self.time_attr=time_attr
-        self.semantic_keywords=semantic_keywords or []; self.file_patterns=file_patterns or []
-    def run(self):
-        hits=[]
-        for path,score in search_files(self.folders, self.keywords, self.allow_exts, self.time_range, self.time_attr, self.semantic_keywords, self.file_patterns):
-            try:
-                from os import stat
-                st=stat(path); hits.append(FileHit(path, int(score), st.st_mtime, st.st_size))
-            except Exception: continue
-        self.results_ready.emit(hits)
+# SearchWorker moved to luma_mod.ui.workers
 
 
-class AIWorker(QThread):
-    info_ready = pyqtSignal(dict)
-    def __init__(self, ai: LumaAI, query: str, use_ai: bool):
-        super().__init__(); self.ai = ai; self.query = query; self.use_ai = use_ai
-    def run(self):
-        try:
-            info = self.ai.parse_query_ai(self.query) if self.use_ai else self.ai.parse_query_nonai(self.query)
-        except Exception:
-            info = self.ai.parse_query_nonai(self.query)
-        self.info_ready.emit(info)
+# AIWorker moved to luma_mod.ui.workers
 
 
-class RerankWorker(QThread):
-    reranked = pyqtSignal(list)
-    def __init__(self, ai: LumaAI, query: str, hits: List[FileHit], time_window=None, file_types=None, folders=None):
-        super().__init__(); self.ai=ai; self.query=query; self.hits=hits
-        self.time_window=time_window; self.file_types=file_types; self.folders=folders
-    def run(self):
-        try:
-            paths = [h.path for h in self.hits][:30]
-            scores = self.ai.rerank_by_name(self.query, paths, self.time_window, self.file_types, self.folders) or {}
-            if not scores:
-                self.reranked.emit(self.hits); return
-            def boosted(h: FileHit) -> FileHit:
-                extra = float(scores.get(h.path, 0.0))
-                return FileHit(h.path, h.score + int(extra), h.mtime, h.size)
-            new_hits = sorted([boosted(h) for h in self.hits], key=lambda x: x.score, reverse=True)
-            self.reranked.emit(new_hits)
-        except Exception:
-            self.reranked.emit(self.hits)
+# RerankWorker moved to luma_mod.ui.workers
 
 
 class SpotlightUI(QWidget):
@@ -151,10 +49,10 @@ class SpotlightUI(QWidget):
         self._rag_folders: List[str] = []
         self._worker: Optional[SearchWorker]=None
         self._ai_worker: Optional[AIWorker]=None
-        # Initialize AI with default mode and API key
-        self.openai_api_key = "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"
-        self.ai_mode = "none"  # "none", "private", or "cloud"
-        self.ai=LumaAI(mode="private", openai_api_key=self.openai_api_key)  # Initialize with private mode but won't be used until selected
+        # Initialize AI with environment-configured defaults (no hardcoded secrets)
+        self.openai_api_key = get_openai_api_key()
+        self.ai_mode = get_default_ai_mode()  # "none", "private", or "cloud"
+        self.ai = LumaAI(mode=self.ai_mode, openai_api_key=self.openai_api_key)
 
         wrapper=QWidget(); wrapper.setObjectName("wrapper")
 
@@ -168,7 +66,7 @@ class SpotlightUI(QWidget):
         
         # Main search input
         self.search=QLineEdit()
-        self.search.setPlaceholderText("Search for apps and commands...")
+        self.search.setPlaceholderText("Search for files or folders...")
         self.search.setObjectName("mainSearch")
         self.search.setMinimumHeight(36)  # Ensure minimum height to prevent squeezing
         
@@ -1575,27 +1473,6 @@ class SpotlightUI(QWidget):
             self.preview.set_file(h.path, self.ai_mode)
 
     # ---------------- AI Summarization -----------------
-    class _SummarizeWorker(QThread):
-        summary_ready = pyqtSignal(str)
-        summary_failed = pyqtSignal(str)
-        def __init__(self, ai: LumaAI, path: str, use_ai: bool):
-            super().__init__(); self.ai=ai; self.path=path; self.use_ai=use_ai
-        def run(self):
-            try:
-                if self.use_ai:
-                    s = self.ai.summarize_file(self.path)
-                    if s:
-                        self.summary_ready.emit(s)
-                    else:
-                        self.summary_failed.emit("Summary unavailable. Check AI mode and dependencies.")
-                else:
-                    s = self.ai.summarize_file_extractive(self.path)
-                    if s:
-                        self.summary_ready.emit(s)
-                    else:
-                        self.summary_failed.emit("Summary unavailable (no text).")
-            except Exception as e:
-                self.summary_failed.emit(f"Summary failed: {str(e)}")
 
     def _summarize_selected(self):
         print(f"DEBUG: _summarize_selected called, ai_mode: {self.ai_mode}")
@@ -1688,7 +1565,7 @@ class SpotlightUI(QWidget):
         else:  # private mode
             use_ai = self.ai._ensure_ollama()  # Use local AI if available, otherwise extractive
         
-        self._sum_worker = self._SummarizeWorker(self.ai, target_path, use_ai)
+        self._sum_worker = SummarizeWorker(self.ai, target_path, use_ai)
         self._sum_worker.summary_ready.connect(lambda text, path=target_path, name=os.path.basename(target_path): self._display_summary_in_preview(name, path, text))
         self._sum_worker.summary_failed.connect(lambda error_msg: self._handle_summarize_error(error_msg))
         self._sum_worker.start()
@@ -1769,16 +1646,7 @@ class SpotlightUI(QWidget):
         self.conversation_preview.set_file(path, self.ai_mode)
         self.conversation_preview.show()
 
-    class _QnAWorker(QThread):
-        answer_ready = pyqtSignal(str)
-        def __init__(self, ai: LumaAI, path: str, question: str):
-            super().__init__(); self.ai=ai; self.path=path; self.question=question
-        def run(self):
-            try:
-                a = self.ai.answer_about_file(self.path, self.question) or "I am not sure based on the file content."
-            except Exception:
-                a = "Question failed."
-            self.answer_ready.emit(a)
+    # QnA worker moved to luma_mod.ui.workers
 
     def _handle_chat_key_press(self, event: QKeyEvent):
         """Handle keyboard events in chat input."""
@@ -1857,7 +1725,7 @@ class SpotlightUI(QWidget):
             self._add_user_message(q)
             self.chat_spinner.start()
             self.chat_view.append("AI is thinking…\n")
-            self._qa_worker = self._QnAWorker(self.ai, self._current_chat_file, q)
+            self._qa_worker = QnAWorker(self.ai, self._current_chat_file, q)
             self._qa_worker.answer_ready.connect(self._apply_answer)
             self._qa_worker.start()
         else:
@@ -2089,18 +1957,11 @@ class SpotlightUI(QWidget):
         """)
 
     # ---------------- Warmup -----------------
-    class _WarmupWorker(QThread):
-        def __init__(self, ai: LumaAI):
-            super().__init__(); self.ai = ai
-        def run(self):
-            try:
-                self.ai.warmup()
-            except Exception:
-                pass
+    # Warmup worker moved to luma_mod.ui.workers
 
     def _warmup_ai(self):
         try:
-            self._warm = self._WarmupWorker(self.ai)
+            self._warm = WarmupWorker(self.ai)
             self._warm.start()
         except Exception:
             pass
