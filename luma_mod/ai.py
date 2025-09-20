@@ -181,9 +181,12 @@ class LumaAI:
         Returns one of: "list", "rag". Default is "list" to preserve existing behavior.
         """
         import re
-        listing_pattern = re.compile(r"\b(list|show|all)\b.*\b(folder|directory|under|in)\b", re.IGNORECASE)
-        crossdoc_pattern = re.compile(r"\b(summar(ize|ise)|compare|what\s+does|mentions?|across|find\s+every|policy|contract|requirements?)\b", re.IGNORECASE)
-        if crossdoc_pattern.search(query):
+        # Strong indicators the user wants items (files/folders)
+        listing_pattern = re.compile(r"\b(list|show|open|find|locate|browse|display|所有文件|顯示|列出)\b.*\b(folder|directory|under|in|path|files?)\b", re.IGNORECASE)
+        # Strong indicators the user wants content/answers
+        crossdoc_pattern = re.compile(r"\b(summar(ize|ise)|compare|what\s+does|mentions?|across|find\s+every|policy|contract|requirements?|explain|analysis|overview|market\s+analysis|why|how)\b", re.IGNORECASE)
+        # If both patterns appear, prioritize listing only when explicit nouns like 'files', 'folder' are present
+        if crossdoc_pattern.search(query) and not re.search(r"\b(files?|folders?|directory|path)\b", query, re.IGNORECASE):
             return "rag"
         if listing_pattern.search(query):
             return "list"
@@ -220,7 +223,18 @@ class LumaAI:
             return {"answer": "Not enough info from the provided files.", "hits": [], "low_confidence": True}
 
         system_msg, user_msg = rag_build_prompt(query, hits, n_ctx=n_ctx)
-        prompt = f"{system_msg}\n\n{user_msg}\n\nAnswer:"
+        # Encourage concise, well-structured answer with quotes and citations
+        system_msg = (
+            system_msg
+            + " Answer in clear markdown with this structure:"
+              "\n- Title: <concise topic>: analysis (use the user's subject)"
+              "\n- Summary (3 bullets): key takeaways with inline citations [1], [2]"
+              "\n- Analysis (2-6 short bullets): concise reasoning grounded in the snippets with citations"
+              "\n- Key quotes (1–3 brief quotes ≤120 chars) with citations"
+              "\n- Bottom line (1–2 sentences)"
+            + " Keep it direct and avoid hedging."
+        )
+        prompt = f"{system_msg}\n\n{user_msg}\n\nProduce the structured answer now:"
         answer = (self._invoke_ai(prompt) or "").strip()
         return {"answer": answer, "hits": hits[:n_ctx], "low_confidence": low_conf}
 

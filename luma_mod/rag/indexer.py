@@ -34,6 +34,9 @@ SUPPORTED_EXTS = {
     ".pdf", ".docx", ".pptx", ".txt", ".md", ".markdown", ".html", ".htm",
 }
 
+# When True, attempt to index all file types as text (with binary safeguards)
+INDEX_ALL_FILE_TYPES = True
+
 
 def ensure_dirs() -> None:
     if not os.path.isdir(RAG_HOME):
@@ -108,9 +111,28 @@ def load_text_from_file(path: str) -> Tuple[str, Optional[List[Tuple[int, str]]]
             import re
             text = re.sub(r"<[^>]+>", " ", html)
             return (text, None)
-        # Fallback
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            return (f.read(), None)
+        # Fallback: best-effort decode for any other type; skip binary-like files
+        try:
+            import chardet  # type: ignore
+            with open(path, "rb") as f:
+                raw = f.read()
+            head = raw[:8192]
+            # Null bytes strongly suggest binary
+            if b"\x00" in head:
+                return ("", None)
+            # Ratio of printable ASCII as a simple heuristic
+            printable = sum(1 for b in head if 32 <= b <= 126 or b in (9, 10, 13))
+            if len(head) > 0 and (printable / max(1, len(head))) < 0.6:
+                return ("", None)
+            enc = chardet.detect(raw).get("encoding") or "utf-8"
+            text = raw.decode(enc, errors="ignore")
+            return (text, None)
+        except Exception:
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    return (f.read(), None)
+            except Exception:
+                return ("", None)
     except Exception:
         return ("", None)
 
@@ -250,7 +272,7 @@ class RAGIndex:
         """
         ensure_dirs()
         ext = os.path.splitext(path)[1].lower()
-        if ext not in SUPPORTED_EXTS:
+        if (not INDEX_ALL_FILE_TYPES) and (ext not in SUPPORTED_EXTS):
             return {"added": 0, "deleted": 0}
         try:
             st = os.stat(path)
@@ -313,34 +335,59 @@ class RAGIndex:
 
         return {"added": len(texts), "deleted": deleted}
 
-    def index_folders(self, folders: List[str], excludes: Optional[List[str]] = None) -> Dict[str, int]:
+    def index_folders(self, folders: List[str], excludes: Optional[List[str]] = None, progress_cb: Optional[callable] = None) -> Dict[str, int]:
         """Recursively index supported files in given folders, respecting excludes.
         Returns counts.
+
+        progress_cb: optional callable(processed:int, total:int, current_path:str)
         """
         excludes = excludes or []
-        added = 0
-        deleted = 0
+        # Pre-scan to compute total files for progress reporting
+        file_list: List[str] = []
         for root in folders:
             if not os.path.isdir(root):
                 continue
             for dirpath, dirnames, filenames in os.walk(root):
-                # prune excludes and hidden dirs
                 dirnames[:] = [d for d in dirnames if not d.startswith('.') and not any(x in d for x in excludes)]
                 for fn in filenames:
                     if fn.startswith('.'):
                         continue
                     path = os.path.join(dirpath, fn)
-                    ext = os.path.splitext(path)[1].lower()
-                    if ext not in SUPPORTED_EXTS:
-                        continue
-                    try:
-                        res = self.index_file(path)
-                        added += res.get("added", 0)
-                        deleted += res.get("deleted", 0)
-                    except Exception:
-                        # Keep indexing even if a file fails
-                        traceback.print_exc()
-                        continue
+                    if INDEX_ALL_FILE_TYPES:
+                        file_list.append(path)
+                    else:
+                        ext = os.path.splitext(path)[1].lower()
+                        if ext in SUPPORTED_EXTS:
+                            file_list.append(path)
+
+        total = len(file_list)
+        processed = 0
+        added = 0
+        deleted = 0
+
+        # Emit initial progress
+        try:
+            if progress_cb:
+                progress_cb(0, total, "")
+        except Exception:
+            pass
+
+        for path in file_list:
+            try:
+                res = self.index_file(path)
+                added += res.get("added", 0)
+                deleted += res.get("deleted", 0)
+            except Exception:
+                # Keep indexing even if a file fails
+                traceback.print_exc()
+            finally:
+                processed += 1
+                try:
+                    if progress_cb:
+                        progress_cb(processed, total, path)
+                except Exception:
+                    pass
+
         return {"added": added, "deleted": deleted}
 
 

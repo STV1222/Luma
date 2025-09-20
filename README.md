@@ -52,7 +52,7 @@ ollama pull gemma2:2b
 pip install sentence-transformers faiss-cpu pypdf python-docx python-pptx chardet watchdog
 
 # Cloud AI (OpenAI)
-pip install openai
+pip install -U openai
 ```
 
 ---

@@ -16,7 +16,12 @@ _STATUS: Dict[str, Any] = {
 }
 
 
-def ensure_index_started(folders: List[str], exclude: List[str] | None = None, replace: bool = False) -> None:
+def ensure_index_started(
+    folders: List[str],
+    exclude: List[str] | None = None,
+    replace: bool = False,
+    progress_cb: "callable | None" = None,
+) -> None:
     """Build/refresh the index.
 
     - folders: roots to index (recursive)
@@ -36,7 +41,11 @@ def ensure_index_started(folders: List[str], exclude: List[str] | None = None, r
             # Recreate empty index lazily on first add
         except Exception:
             pass
-    res = idx.index_folders(folders, excludes=exclude)
+    try:
+        res = idx.index_folders(folders, excludes=exclude, progress_cb=progress_cb)
+    except TypeError:
+        # Backward compatibility if indexer signature differs
+        res = idx.index_folders(folders, excludes=exclude)
     _STATUS["folders"] = folders
     _STATUS["chunks"] = idx.size
     _STATUS["last_update"] = res

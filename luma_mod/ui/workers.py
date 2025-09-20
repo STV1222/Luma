@@ -164,3 +164,42 @@ class WarmupWorker(QThread):
             pass
 
 
+
+class IndexWorker(QThread):
+    progress = pyqtSignal(int, int, str)  # processed, total, current_path
+    finished_with_result = pyqtSignal(dict)
+
+    def __init__(self, folders: List[str], exclude: Optional[List[str]] = None, replace: bool = False):
+        super().__init__()
+        self.folders = folders
+        self.exclude = exclude or []
+        self.replace = replace
+
+    def run(self):
+        try:
+            # Lazy imports to avoid heavy deps on UI thread
+            from luma_mod.rag.indexer import RAGIndex, FAISS_PATH, META_PATH
+            import os as _os
+
+            if self.replace:
+                try:
+                    if _os.path.exists(FAISS_PATH):
+                        _os.remove(FAISS_PATH)
+                    if _os.path.exists(META_PATH):
+                        _os.remove(META_PATH)
+                except Exception:
+                    pass
+
+            idx = RAGIndex()
+
+            def _cb(processed: int, total: int, current_path: str):
+                try:
+                    self.progress.emit(processed, total, current_path)
+                except Exception:
+                    pass
+
+            res = idx.index_folders(self.folders, excludes=self.exclude, progress_cb=_cb)
+        except Exception:
+            res = {"added": 0, "deleted": 0}
+        self.finished_with_result.emit(res)
+

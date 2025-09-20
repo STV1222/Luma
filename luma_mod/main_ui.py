@@ -3,7 +3,7 @@ import os
 from typing import Optional, List
 
 from PyQt6.QtCore import Qt, QTimer, QUrl
-from PyQt6.QtWidgets import QWidget, QFrame, QLineEdit, QComboBox, QListView, QVBoxLayout, QHBoxLayout, QSplitter, QSizePolicy, QTextEdit, QPushButton, QLabel, QStackedLayout, QTextBrowser, QFileDialog, QDialog, QListWidget, QDialogButtonBox
+from PyQt6.QtWidgets import QWidget, QFrame, QLineEdit, QComboBox, QListView, QVBoxLayout, QHBoxLayout, QSplitter, QSizePolicy, QTextEdit, QPushButton, QLabel, QStackedLayout, QTextBrowser, QFileDialog, QDialog, QListWidget, QDialogButtonBox, QProgressDialog
 from PyQt6.QtGui import QTextCursor, QMouseEvent, QKeyEvent, QGuiApplication
 
 from .utils import DEFAULT_FOLDERS, FILETYPE_MAP, divider, center_on_screen, os_open, make_paths_clickable
@@ -20,6 +20,7 @@ from .ui.workers import (
     SummarizeWorker,
     QnAWorker,
     WarmupWorker,
+    IndexWorker,
 )
 from .config import get_openai_api_key, get_default_ai_mode
 
@@ -598,11 +599,9 @@ class SpotlightUI(QWidget):
         if not selected:
             selected = [self.folder_list.item(i).text() for i in range(self.folder_list.count())]
         self._rag_folders = selected
+        # Start background indexing with progress dialog
         try:
-            from luma_mod.rag.service import ensure_index_started
-            # Replace index with the newly selected folders to strictly scope RAG
-            ensure_index_started(self._rag_folders, exclude=["node_modules", "__pycache__", ".git"], replace=True)
-            self._add_ai_message("Indexing (fresh) started for selected folders. RAG will only use these folders.")
+            self._start_indexing(self._rag_folders, exclude=["node_modules", "__pycache__", ".git"], replace=True)
         except Exception:
             pass
         # Update chips in both search header and chat header
@@ -1739,9 +1738,7 @@ class SpotlightUI(QWidget):
                 action_param = (parse_qs(url.query()).get("action", [""])[0]).lower()
                 if action_param == "init":
                     try:
-                        from luma_mod.rag.service import ensure_index_started
-                        ensure_index_started(self._folders, exclude=["node_modules", "__pycache__", ".git"])
-                        self._add_ai_message("Indexing started. You can keep asking questions; results will improve as indexing progresses.")
+                        self._start_indexing(self._folders, exclude=["node_modules", "__pycache__", ".git"], replace=False)
                     except Exception:
                         self._add_ai_message("Failed to start indexing. Please try again.")
     
@@ -1765,6 +1762,42 @@ class SpotlightUI(QWidget):
                 self._current_conversation_hits = [file_hit]
             except Exception:
                 self._current_conversation_hits = []
+
+    def _start_indexing(self, folders: List[str], exclude: List[str], replace: bool) -> None:
+        # Create progress dialog
+        dlg = QProgressDialog("Indexing documents…", "Cancel", 0, 100, self)
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(True)
+        dlg.setAutoReset(True)
+
+        self._index_worker = IndexWorker(folders, exclude, replace)
+
+        def _on_progress(processed: int, total: int, current_path: str):
+            try:
+                pct = 0 if total <= 0 else int((processed / max(1, total)) * 100)
+                dlg.setValue(min(max(pct, 0), 100))
+                if current_path:
+                    base = os.path.basename(current_path)
+                    dlg.setLabelText(f"Indexing: {base}")
+                if dlg.wasCanceled():
+                    # Not implementing hard cancel to keep index consistent; just ignore
+                    pass
+            except Exception:
+                pass
+
+        def _on_finished(res: dict):
+            try:
+                dlg.setValue(100)
+                added = int(res.get("added", 0))
+                deleted = int(res.get("deleted", 0))
+                self._add_ai_message(f"Index finished. Added {added} chunks, removed {deleted}.")
+            except Exception:
+                pass
+
+        self._index_worker.progress.connect(_on_progress)
+        self._index_worker.finished_with_result.connect(_on_finished)
+        self._index_worker.start()
 
     def _ask_follow_up(self):
         q = self.chat_input.text().strip()
